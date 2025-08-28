@@ -77,7 +77,14 @@ type FlowSession struct {
 	OutIf          int       `json:"out_if,omitempty"`
 	SrcCountry     string    `json:"src_country,omitempty"`
 	DstCountry     string    `json:"dst_country,omitempty"`
-	Notes          string    `json:"notes,omitempty"`
+	// Optional cumulative counters and end reason (if exporter provides them)
+	CumBytes   int64  `json:"cum_bytes,omitempty"`
+	CumPackets int64  `json:"cum_packets,omitempty"`
+	EndReason  int    `json:"end_reason,omitempty"`
+	Notes      string `json:"notes,omitempty"`
+	// Open session heartbeat formatting flags (not serialized)
+	OpenStart bool `json:"-"`
+	OpenEnd   bool `json:"-"`
 }
 
 // minuteAcc accumulates bytes and packets in a time bucket
@@ -96,6 +103,9 @@ type Store struct {
 	mu       sync.RWMutex
 	sessions []FlowSession
 
+	// Opportunistic compaction gate
+	compacting int32
+
 	// Concurrent maps storing indexed data for fast IP/protocol views
 	srcMap         cmap.ConcurrentMap[string, map[string][]FlowSession] // SrcIP -> (DstIP -> recent sessions), pruned to retentionMinutes
 	ipMinuteTx     cmap.ConcurrentMap[string, minuteAcc]                // "IP|unixMinute" -> tx bytes/packets
@@ -106,6 +116,9 @@ type Store struct {
 	pairMinute     cmap.ConcurrentMap[string, minuteAcc]                // "SRC|DST|unixMinute" combined bytes/packets
 	pairMinuteSess cmap.ConcurrentMap[string, int64]                    // "SRC|DST|unixMinute" -> session count
 
+	// Per-flow state for delta tracking and start/end management
+	flowStates cmap.ConcurrentMap[string, flowTrack]
+
 	// Cross-router dedup: normalized 5-tuple signature -> owner router and last-seen time
 	dedupOwners cmap.ConcurrentMap[string, sigOwner]
 }
@@ -114,6 +127,27 @@ type Store struct {
 type sigOwner struct {
 	Router   string
 	LastSeen time.Time
+}
+
+// flowTrack keeps state for a long-lived flow to compute deltas and proper start/end times
+// It is keyed by flowKey (router, src/dst, ports, protocol, in/out iface)
+// Start is the first Export Timestamp when this flow key was first seen.
+// LastExport is the last Export Timestamp processed for this key.
+// LastCum* are last seen cumulative counters; -1 means unknown/not provided.
+// When exporter sends deltas (octetDeltaCount), we pass Bytes as-is and leave LastCum* at -1.
+// When exporter sends totals (octetTotalCount), we compute delta = max(0, cur - LastCum).
+// End is considered final when EndReason > 0 (if provided). We then remove the state.
+// States are pruned after inactivity > retentionMinutes.
+
+type flowTrack struct {
+	Start          time.Time
+	LastExport     time.Time
+	LastCumBytes   int64
+	LastCumPkts    int64
+	LastHourLogged time.Time
+	Emitted        bool
+	SumBytes       int64
+	SumPkts        int64
 }
 
 // tsdbWriter asynchronously writes compact flow records to a Windows-friendly time-series folder layout.
@@ -298,7 +332,8 @@ func (t *tsdbWriter) EnqueueMany(sessions []FlowSession) {
 	}
 	for i := range sessions {
 		s := sessions[i]
-		if s.Bytes <= 0 {
+		// Skip zero-byte/zero-packet non-final entries, but allow zero-byte finals (End set)
+		if s.Bytes <= 0 && s.Packets <= 0 && s.End.IsZero() {
 			continue
 		}
 		// src
@@ -359,15 +394,29 @@ func (t *tsdbWriter) buildPathAndLine(isSrc bool, s FlowSession) (string, []byte
 	}
 	st := start.UTC()
 	et := end.UTC()
-	y := strconv.Itoa(st.Year())
-	m := twoDigit(int(st.Month()))
-	d := twoDigit(st.Day())
-	hh := twoDigit(st.Hour())
+	// Folder hour: for open-ended (ongoing) entries, use the export/timestamp hour; otherwise use start hour
+	folderTime := st
+	if s.OpenEnd {
+		folderTime = s.Timestamp.UTC()
+	}
+	y := strconv.Itoa(folderTime.Year())
+	m := twoDigit(int(folderTime.Month()))
+	d := twoDigit(folderTime.Day())
+	hh := twoDigit(folderTime.Hour())
 	p := filepath.Join(t.root, y, m, d, hh,
 		strconv.Itoa(int(v4[0])), strconv.Itoa(int(v4[1])), strconv.Itoa(int(v4[2])), strconv.Itoa(int(v4[3])), name)
+	// Build start/end strings (placeholders when requested)
+	startStr := fmt.Sprintf("%02d:%02d:%02d", st.Hour(), st.Minute(), st.Second())
+	if s.OpenStart {
+		startStr = "--:--:--"
+	}
+	endStr := fmt.Sprintf("%02d:%02d:%02d", et.Hour(), et.Minute(), et.Second())
+	if s.OpenEnd {
+		endStr = "--:--:--"
+	}
 	// Enhanced line: "HH:MM:SS HH:MM:SS bytes packets proto srcIP:srcPort > dstIP:dstPort router=R\n"
-	line := []byte(fmt.Sprintf("%02d:%02d:%02d %02d:%02d:%02d %d %d %s %s:%d > %s:%d router=%s\n",
-		st.Hour(), st.Minute(), st.Second(), et.Hour(), et.Minute(), et.Second(), s.Bytes, s.Packets,
+	line := []byte(fmt.Sprintf("%s %s %d %d %s %s:%d > %s:%d router=%s\n",
+		startStr, endStr, s.Bytes, s.Packets,
 		strings.ToUpper(strings.TrimSpace(s.Protocol)), strings.TrimSpace(s.SrcIP), s.SrcPort, strings.TrimSpace(s.DstIP), s.DstPort, strings.TrimSpace(s.Router)))
 	return p, line, true
 }
@@ -382,13 +431,15 @@ func NewStore() *Store {
 	s.ipProtoRx = cmap.New[minuteAcc]()
 	s.pairMinute = cmap.New[minuteAcc]()
 	s.pairMinuteSess = cmap.New[int64]()
+	s.flowStates = cmap.New[flowTrack]()
 	s.dedupOwners = cmap.New[sigOwner]()
 	return s
 }
 
 // internal configuration (populated in main)
 var (
-	retentionMinutes                = 10
+	retentionMinutes                = 15
+	flowTimeoutMinutes              = 10
 	aggregateOlderThanMinutes       = 0
 	aggregateBucketSeconds          = 60
 	compactEverySeconds             = 30
@@ -407,28 +458,56 @@ func (s *Store) AddMany(items []FlowSession) int {
 			return 0
 		}
 	}
-	// Append to primary slice under lock
+	// Apply flow tracking to compute deltas and proper Start/End handling, plus open-session heartbeats
+	tracked, opens := s.applyFlowTracking(accepted)
+	if len(tracked) == 0 && len(opens) == 0 {
+		return 0
+	}
+	// Append tracked (non-heartbeat) to primary slice under lock
+	shouldCompact := false
 	s.mu.Lock()
-	s.sessions = append(s.sessions, accepted...)
-	// Opportunistic compact trigger based on size threshold
-	if len(s.sessions) > maxSessionsBeforeCompactTrigger {
-		go s.Compact()
+	if len(tracked) > 0 {
+		s.sessions = append(s.sessions, tracked...)
+		// Opportunistic compact trigger based on size threshold (gated)
+		if len(s.sessions) > maxSessionsBeforeCompactTrigger {
+			shouldCompact = true
+		}
 	}
 	s.mu.Unlock()
-	// Update concurrent indices and summaries without holding the store lock
-	s.indexAndSummarize(accepted)
-	// Persist to TSDB if enabled
-	if tsdb != nil {
-		tsdb.EnqueueMany(accepted)
+	// Fire compact outside the lock and gate to a single goroutine
+	if shouldCompact && atomic.CompareAndSwapInt32(&s.compacting, 0, 1) {
+		go func() {
+			defer atomic.StoreInt32(&s.compacting, 0)
+			defer func() {
+				if r := recover(); r != nil {
+					log.Printf("Compact panic: %v", r)
+				}
+			}()
+			s.Compact()
+			s.pruneSummaries()
+		}()
 	}
-	// Broadcast to WS listeners (non-blocking)
-	for _, s := range accepted {
+	// Update concurrent indices and summaries without holding the store lock
+	if len(tracked) > 0 {
+		s.indexAndSummarize(tracked)
+	}
+	// Persist to TSDB: write all tracked items (non-final with data are allowed by EnqueueMany) and open heartbeats
+	if tsdb != nil {
+		if len(tracked) > 0 {
+			tsdb.EnqueueMany(tracked)
+		}
+		if len(opens) > 0 {
+			tsdb.EnqueueOpenMany(opens)
+		}
+	}
+	// Broadcast to WS listeners (non-blocking) only tracked items (not heartbeats)
+	for _, s := range tracked {
 		select {
 		case newSessionsChan <- s:
 		default:
 		}
 	}
-	return len(accepted)
+	return len(tracked)
 }
 
 // applyDedup filters a batch to keep only sessions owned by a single router per 5-tuple within a TTL.
@@ -464,6 +543,114 @@ func (s *Store) applyDedup(items []FlowSession) []FlowSession {
 		}
 	}
 	return acc
+}
+
+// applyFlowTracking computes deltas for ongoing sessions and manages Start/End
+func (s *Store) applyFlowTracking(items []FlowSession) ([]FlowSession, []FlowSession) {
+	if len(items) == 0 {
+		return items, nil
+	}
+	out := make([]FlowSession, 0, len(items))
+	opens := make([]FlowSession, 0)
+	for _, in := range items {
+		k := flowKey(in)
+		exportTs := in.Timestamp
+		st, ok := s.flowStates.Get(k)
+		if !ok {
+			st = flowTrack{Start: exportTs, LastExport: exportTs, LastCumBytes: -1, LastCumPkts: -1}
+		}
+		// Determine deltas
+		var dB, dP int64
+		if in.CumBytes > 0 {
+			if st.LastCumBytes >= 0 {
+				dB = in.CumBytes - st.LastCumBytes
+			} else {
+				dB = 0
+			}
+			st.LastCumBytes = in.CumBytes
+		} else {
+			dB = in.Bytes
+		}
+		if in.CumPackets > 0 {
+			if st.LastCumPkts >= 0 {
+				dP = in.CumPackets - st.LastCumPkts
+			} else {
+				dP = 0
+			}
+			st.LastCumPkts = in.CumPackets
+		} else {
+			dP = in.Packets
+		}
+		if dB < 0 {
+			dB = 0
+		}
+		if dP < 0 {
+			dP = 0
+		}
+		// accumulate running sums for delta-only flows
+		st.SumBytes += dB
+		st.SumPkts += dP
+		st.LastExport = exportTs
+
+		// Determine finalization: explicit reason or End provided
+		final := in.EndReason != 0 || (!in.End.IsZero())
+		outSess := in
+		outSess.Bytes = dB
+		outSess.Packets = dP
+		// Ensure Start is the earliest between input Start (if any) and tracked Start
+		if !in.Start.IsZero() && (st.Start.IsZero() || in.Start.Before(st.Start)) {
+			st.Start = in.Start
+		}
+		outSess.Start = st.Start
+
+		// Heartbeat/open entry once per hour: only for flows that started before this hour
+		curHour := exportTs.UTC().Truncate(time.Hour)
+		if (st.LastHourLogged.IsZero() || !st.LastHourLogged.UTC().Equal(curHour)) && st.Start.Before(curHour) {
+			open := outSess
+			open.OpenEnd = true
+			open.OpenStart = true
+			open.Bytes = 0
+			open.Packets = 0
+			open.Timestamp = exportTs
+			opens = append(opens, open)
+			st.LastHourLogged = curHour
+		}
+
+		// If final but we haven't emitted any data and only have cumulative totals, use totals
+		if final && dB == 0 && dP == 0 && !st.Emitted {
+			if in.CumBytes > 0 {
+				outSess.Bytes = in.CumBytes
+			}
+			if in.CumPackets > 0 {
+				outSess.Packets = in.CumPackets
+			}
+		}
+
+		// Write back state (unless finalized below)
+		s.flowStates.Set(k, st)
+
+		if final {
+			// Final: End should be export timestamp if not provided
+			if outSess.End.IsZero() {
+				outSess.End = exportTs
+			}
+			// Remove state upon finalization
+			s.flowStates.Remove(k)
+		}
+		// Only append when there is any accounting to add or when finalizing (to ensure TSDB has start/end)
+		if dB > 0 || dP > 0 || final {
+			// mark emitted if we actually carry data
+			if outSess.Bytes > 0 || outSess.Packets > 0 {
+				st.Emitted = true
+				// persist updated Emitted if not final (if final, state removed anyway)
+				if !final {
+					s.flowStates.Set(k, st)
+				}
+			}
+			out = append(out, outSess)
+		}
+	}
+	return out, opens
 }
 
 // Compact applies retention policy and optional aggregation to reduce memory usage.
@@ -556,21 +743,71 @@ func (s *Store) Compact() {
 	sort.Slice(s.sessions, func(i, j int) bool { return effectiveEndOrTs(s.sessions[i]).Before(effectiveEndOrTs(s.sessions[j])) })
 }
 
-// StartMaintenance starts a background ticker that periodically compacts the store.
+// StartMaintenance starts background routines: compaction/summaries and hourly open-session emits.
 func (s *Store) StartMaintenance(ctx context.Context) {
-	if compactEverySeconds <= 0 {
-		return
+	// Compaction ticker (optional)
+	if compactEverySeconds > 0 {
+		ticker := time.NewTicker(time.Duration(compactEverySeconds) * time.Second)
+		go func() {
+			defer ticker.Stop()
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case <-ticker.C:
+					s.Compact()
+					s.pruneSummaries()
+				}
+			}
+		}()
 	}
-	ticker := time.NewTicker(time.Duration(compactEverySeconds) * time.Second)
+	// Hourly open-session heartbeat emitter: ensures ongoing sessions appear in each hour's logs
 	go func() {
-		defer ticker.Stop()
+		// Tick every 15s; act only when hour changes
+		tick := time.NewTicker(15 * time.Second)
+		defer tick.Stop()
+		var lastHour time.Time
 		for {
 			select {
 			case <-ctx.Done():
 				return
-			case <-ticker.C:
-				s.Compact()
-				s.pruneSummaries()
+			case <-tick.C:
+				curHour := time.Now().UTC().Truncate(time.Hour)
+				if lastHour.Equal(curHour) {
+					continue
+				}
+				lastHour = curHour
+				if tsdb == nil {
+					continue
+				}
+				// Build open entries for all active flow states that were not logged for this hour yet
+				opens := make([]FlowSession, 0, 1024)
+				for k, st := range s.flowStates.Items() {
+					if !st.LastHourLogged.IsZero() && st.LastHourLogged.UTC().Equal(curHour) {
+						continue
+					}
+					// Only emit open heartbeat for flows that started before this hour
+					if !st.Start.Before(curHour) {
+						continue
+					}
+					fs, ok := flowSessionFromKey(k, st)
+					if !ok {
+						continue
+					}
+					fs.OpenEnd = true
+					fs.OpenStart = true
+					fs.Bytes = 0
+					fs.Packets = 0
+					fs.Timestamp = time.Now()
+					fs.Start = st.Start
+					opens = append(opens, fs)
+					// Update state to avoid duplicates from both tick and ingestion
+					st.LastHourLogged = curHour
+					s.flowStates.Set(k, st)
+				}
+				if len(opens) > 0 {
+					tsdb.EnqueueOpenMany(opens)
+				}
 			}
 		}
 	}()
@@ -830,6 +1067,9 @@ func main() {
 	if n, err := strconv.Atoi(getenv("RETENTION_MINUTES", fmt.Sprintf("%d", retentionMinutes))); err == nil {
 		retentionMinutes = n
 	}
+	if n, err := strconv.Atoi(getenv("FLOW_TIMEOUT_MINUTES", fmt.Sprintf("%d", flowTimeoutMinutes))); err == nil {
+		flowTimeoutMinutes = n
+	}
 	if n, err := strconv.Atoi(getenv("COMPACT_EVERY_SECONDS", fmt.Sprintf("%d", compactEverySeconds))); err == nil {
 		compactEverySeconds = n
 	}
@@ -920,7 +1160,7 @@ func main() {
 			tsdb.filterCIDRs = nets
 			log.Printf("TSDB filter: %d CIDRs active", len(nets))
 		}
- 	tsdb.Start(bgCtx)
+		tsdb.Start(bgCtx)
 		log.Printf("TSDB enabled: root=%s shards=%d queue=%d", root, shards, qsize)
 	}
 
@@ -2752,7 +2992,7 @@ func logRequests(next http.Handler) http.Handler {
 // gzip middleware for responses when client supports it. Skips WebSocket upgrades.
 type gzipResponseWriter struct {
 	http.ResponseWriter
-	gz         *gzip.Writer
+	gz          *gzip.Writer
 	wroteHeader bool
 }
 
@@ -3127,6 +3367,12 @@ func parseV9(p []byte, router string, recvTime time.Time) []FlowSession {
 						s.Bytes = int64(readUintBE(fld))
 					case 2: // packetDeltaCount
 						s.Packets = int64(readUintBE(fld))
+					case 85: // octetTotalCount
+						s.CumBytes = int64(readUintBE(fld))
+					case 86: // packetTotalCount
+						s.CumPackets = int64(readUintBE(fld))
+					case 136: // flowEndReason
+						s.EndReason = int(readUintBE(fld))
 					case 24: // postPacketDeltaCount
 						s.PostPackets = int64(readUintBE(fld))
 					case 21: // last_switched (ms since boot)
@@ -3266,6 +3512,12 @@ func parseIPFIX(p []byte, router string, recvTime time.Time) []FlowSession {
 						s.Bytes = int64(readUintBE(fld))
 					case 2: // packetDeltaCount
 						s.Packets = int64(readUintBE(fld))
+					case 85: // octetTotalCount
+						s.CumBytes = int64(readUintBE(fld))
+					case 86: // packetTotalCount
+						s.CumPackets = int64(readUintBE(fld))
+					case 136: // flowEndReason
+						s.EndReason = int(readUintBE(fld))
 					case 24: // postPacketDeltaCount
 						s.PostPackets = int64(readUintBE(fld))
 					case 150: // flowStartSeconds
@@ -3360,6 +3612,7 @@ func parseNetFlowPacket(p []byte, src *net.UDPAddr, recvTime time.Time) []FlowSe
 				Protocol:  protocolNumberToString(proto),
 				Bytes:     int64(dOctets),
 				Packets:   int64(dPkts),
+				EndReason: 1, // v5 exports are final records for the flow snapshot
 				Notes:     "netflow v5",
 				InIf:      int(inIf),
 				OutIf:     int(outIf),
@@ -3505,6 +3758,34 @@ func flowSig(s FlowSession) string {
 	return fmt.Sprintf("%s|%d|%s|%d|%s", s.SrcIP, s.SrcPort, s.DstIP, s.DstPort, s.Protocol)
 }
 
+// flowSessionFromKey reconstructs a FlowSession identity from a flowKey and flowTrack state.
+// Expected key format: Router|SrcIP|SrcPort|DstIP|DstPort|Protocol|InIf|OutIf
+func flowSessionFromKey(key string, ft flowTrack) (FlowSession, bool) {
+	parts := strings.Split(key, "|")
+	if len(parts) != 8 {
+		return FlowSession{}, false
+	}
+	srcPort, err1 := strconv.Atoi(parts[2])
+	dstPort, err2 := strconv.Atoi(parts[4])
+	inIf, err3 := strconv.Atoi(parts[6])
+	outIf, err4 := strconv.Atoi(parts[7])
+	if err1 != nil || err2 != nil || err3 != nil || err4 != nil {
+		return FlowSession{}, false
+	}
+	fs := FlowSession{
+		Start:    ft.Start,
+		Router:   parts[0],
+		SrcIP:    parts[1],
+		SrcPort:  srcPort,
+		DstIP:    parts[3],
+		DstPort:  dstPort,
+		Protocol: parts[5],
+		InIf:     inIf,
+		OutIf:    outIf,
+	}
+	return fs, true
+}
+
 // effectiveEndOrTs returns End if set, otherwise Timestamp.
 func effectiveEndOrTs(s FlowSession) time.Time {
 	if !s.End.IsZero() {
@@ -3515,6 +3796,9 @@ func effectiveEndOrTs(s FlowSession) time.Time {
 
 // minuteBucketUnix returns the unix timestamp of the start of the minute for t (UTC)
 func minuteBucketUnix(t time.Time) int64 { return t.UTC().Truncate(time.Minute).Unix() }
+
+// fiveMinuteBucketUnix returns the unix timestamp of the start of the 5-minute bucket for t (UTC)
+func fiveMinuteBucketUnix(t time.Time) int64 { return t.UTC().Truncate(5 * time.Minute).Unix() }
 
 // minuteFromKey parses a key formatted as "<prefix>|<unixMinute>" and returns the minute unix time.
 func minuteFromKey(k string) (int64, bool) {
@@ -3593,8 +3877,9 @@ func (s *Store) indexAndSummarize(items []FlowSession) {
 				}
 				return newVal
 			})
-			// per IP pair (directional) totals for peers
-			pairKey := fmt.Sprintf("%s|%s|%d", sess.SrcIP, sess.DstIP, m)
+			// per IP pair (directional) totals using 5-minute buckets
+			m5 := fiveMinuteBucketUnix(effectiveEndOrTs(sess))
+			pairKey := fmt.Sprintf("%s|%s|%d", sess.SrcIP, sess.DstIP, m5)
 			s.pairMinute.Upsert(pairKey, add, func(exist bool, cur, newVal minuteAcc) minuteAcc {
 				if exist {
 					cur.Bytes += newVal.Bytes
@@ -3603,7 +3888,7 @@ func (s *Store) indexAndSummarize(items []FlowSession) {
 				}
 				return newVal
 			})
-			// per IP pair session count (count sessions, not packets)
+			// per IP pair session count: count every observed session record (compatibility with UI peers expectations)
 			s.pairMinuteSess.Upsert(pairKey, 1, func(exist bool, cur, newVal int64) int64 {
 				if exist {
 					return cur + 1
@@ -3652,6 +3937,57 @@ func (s *Store) pruneSummaries() {
 			s.pairMinuteSess.Remove(k)
 		}
 	}
+	// prune per-flow tracking states by inactivity (flowTimeoutMinutes)
+	ftm := flowTimeoutMinutes
+	if ftm <= 0 {
+		ftm = 10
+	}
+	idleCutoff := time.Now().Add(-time.Duration(ftm) * time.Minute)
+	// finalize and prune inactive flow states
+	expired := make([]FlowSession, 0)
+	for k, v := range s.flowStates.Items() {
+		if v.LastExport.Before(idleCutoff) {
+			// reconstruct session identity
+			if fs, ok := flowSessionFromKey(k, v); ok {
+				fs.Timestamp = v.LastExport
+				fs.Start = v.Start
+				fs.End = v.LastExport
+				// Prefer exporter cumulative totals; otherwise, use accumulated deltas
+				tb := v.LastCumBytes
+				tp := v.LastCumPkts
+				if tb == 0 && v.SumBytes > 0 {
+					tb = v.SumBytes
+				}
+				if tp == 0 && v.SumPkts > 0 {
+					tp = v.SumPkts
+				}
+				fs.Bytes = tb
+				fs.Packets = tp
+				expired = append(expired, fs)
+			}
+			// remove state
+			s.flowStates.Remove(k)
+		}
+	}
+	if len(expired) > 0 {
+		// append to store
+		s.mu.Lock()
+		s.sessions = append(s.sessions, expired...)
+		s.mu.Unlock()
+		// update summaries
+		s.indexAndSummarize(expired)
+		// persist finals
+		if tsdb != nil {
+			tsdb.EnqueueMany(expired)
+		}
+		// broadcast
+		for _, sfs := range expired {
+			select {
+			case newSessionsChan <- sfs:
+			default:
+			}
+		}
+	}
 	// prune dedup owners
 	if dedupEnable {
 		now := time.Now()
@@ -3688,6 +4024,7 @@ func (s *Store) buildIPSeries(m cmap.ConcurrentMap[string, minuteAcc], ip string
 }
 
 // ipViewHandler provides per-IP tx/rx series and session lists.
+// It now builds series by scanning the filesystem logs (TSDB) instead of in-memory aggregates.
 func ipViewHandler(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -3705,6 +4042,9 @@ func ipViewHandler(w http.ResponseWriter, r *http.Request) {
 		if n, err := strconv.Atoi(v); err == nil && n > 0 {
 			stepSec = n
 		}
+	}
+	if stepSec < 60 || stepSec%60 != 0 {
+		stepSec = 60
 	}
 	var since, until time.Time
 	if sinceStr != "" {
@@ -3724,17 +4064,68 @@ func ipViewHandler(w http.ResponseWriter, r *http.Request) {
 	if since.IsZero() {
 		since = until.Add(-1 * time.Hour)
 	}
+	// align start to step for consistent charting
+	step := time.Duration(stepSec) * time.Second
+	startAligned := since.Truncate(step)
 
-	// Series from minute summaries
-	tx := store.buildIPSeries(store.ipMinuteTx, ip, since, until, stepSec)
-	rx := store.buildIPSeries(store.ipMinuteRx, ip, since, until, stepSec)
+	// Build series from filesystem logs
+	buildSeries := func(side string) []map[string]any {
+		root := currentTSDBRoot()
+		// Collect all items for the window; page through if needed
+		var items []fsLogItem
+		offset := 0
+		const pageSize = 100000
+		for {
+			batch, more, err := scanIPLogs(root, ip, since, until, side, fsLogFilters{}, offset, pageSize)
+			if err != nil {
+				break
+			}
+			items = append(items, batch...)
+			if !more || len(batch) == 0 {
+				break
+			}
+			offset += len(batch)
+		}
+		// Aggregate into per-minute bins using End time
+		mins := make(map[int64]minuteAcc)
+		for _, it := range items {
+			et, ok := parseTime(it.End)
+			if !ok {
+				continue
+			}
+			m := minuteBucketUnix(et)
+			acc := mins[m]
+			acc.Bytes += it.Bytes
+			acc.Packets += it.Packets
+			mins[m] = acc
+		}
+		// Build step-aligned points by summing minute bins inside each step
+		var pts []map[string]any
+		for t := startAligned; !t.After(until); t = t.Add(step) {
+			end := t.Add(step)
+			var b, p int64
+			for mt := t.Truncate(time.Minute); mt.Before(end); mt = mt.Add(time.Minute) {
+				mu := minuteBucketUnix(mt)
+				if acc, ok := mins[mu]; ok {
+					b += acc.Bytes
+					p += acc.Packets
+				}
+			}
+			bps := float64(b*8) / float64(stepSec)
+			pts = append(pts, map[string]any{"ts": t.UTC().Format(time.RFC3339), "bytes": b, "packets": p, "bps": bps})
+		}
+		return pts
+	}
+
+	tx := buildSeries("src")
+	rx := buildSeries("dst")
 
 	// Sessions lists omitted to minimize CPU: return empty lists.
 	var asSrc, asDst []FlowSession
 
 	payload := map[string]any{
 		"ip":        ip,
-		"since":     since.UTC().Format(time.RFC3339),
+		"since":     startAligned.UTC().Format(time.RFC3339),
 		"until":     until.UTC().Format(time.RFC3339),
 		"step":      stepSec,
 		"tx_points": tx,
@@ -4154,18 +4545,11 @@ func ipPeersHandler(w http.ResponseWriter, r *http.Request) {
 	step := time.Duration(stepSec) * time.Second
 	startAligned := since.Truncate(step)
 
-	// Collect per-peer minute bins and totals, restricted by TSDB_FILTER_CIDRS
+	// Collect per-peer minute bins and totals (no CIDR filtering for peers endpoint)
 	bins := make(map[string]map[int64]minuteAcc) // peer -> mUnix -> acc
 	totals := make(map[string]int64)
 	sessionTotals := make(map[string]int64)
-	// Per-request memoization for allowlist checks
-	allowedCache := make(map[string]bool)
-	// Require the selected IP to be allowed as well
-	allowedIP, okSel := allowedCache[ip]
-	if !okSel {
-		allowedIP = ipInLoggingPrefixes(ip)
-		allowedCache[ip] = allowedIP
-	}
+	// CIDR filter bypassed for peers endpoint; include all peers regardless of configured UI/TSDB CIDR filters.
 	for k, acc := range store.pairMinute.Items() {
 		mUnix, ok := minuteFromKey(k)
 		if !ok {
@@ -4192,18 +4576,6 @@ func ipPeersHandler(w http.ResponseWriter, r *http.Request) {
 		} else if dst == ip {
 			peer = src
 		} else {
-			continue
-		}
-		// Apply CIDR filter: both selected IP and peer must be allowed
-		if !allowedIP {
-			continue
-		}
-		allowedPeer, okp := allowedCache[peer]
-		if !okp {
-			allowedPeer = ipInLoggingPrefixes(peer)
-			allowedCache[peer] = allowedPeer
-		}
-		if !allowedPeer {
 			continue
 		}
 		mm := bins[peer]
@@ -4368,16 +4740,21 @@ func ipTableHandler(w http.ResponseWriter, r *http.Request) {
 	type agg struct{ Tx15, Rx15, Tx1h, Rx1h, Tx8h, Rx8h int64 }
 	acc := make(map[string]*agg)
 
-	// helper to add from a minutes map into the appropriate buckets (with IP allowlist cache)
+	// Build totals from per-IP minute aggregates (far fewer keys than per-pair),
+	// counting TX for src IP and RX for dst IP. Respect logging CIDR filter using a memoized cache.
 	allowedCache := make(map[string]bool)
 	addFrom := func(isTx bool, m cmap.ConcurrentMap[string, minuteAcc]) {
 		for k, v := range m.Items() {
 			mu, ok := minuteFromKey(k)
-			if !ok {
+			if !ok || mu < cut8h {
 				continue
 			}
-			ip := k[:strings.LastIndex(k, "|")]
-			// filter by logging prefixes with memoization
+			// key format: IP|unixMinute
+			idx := strings.LastIndex(k, "|")
+			if idx <= 0 {
+				continue
+			}
+			ip := k[:idx]
 			allowed, okc := allowedCache[ip]
 			if !okc {
 				allowed = ipInLoggingPrefixes(ip)
@@ -4391,25 +4768,21 @@ func ipTableHandler(w http.ResponseWriter, r *http.Request) {
 				a = &agg{}
 				acc[ip] = a
 			}
-			if mu >= cut8h {
-				if isTx {
-					a.Tx8h += v.Bytes
-				} else {
-					a.Rx8h += v.Bytes
-				}
+			if isTx {
+				a.Tx8h += v.Bytes
 				if mu >= cut1h {
-					if isTx {
-						a.Tx1h += v.Bytes
-					} else {
-						a.Rx1h += v.Bytes
-					}
-					if mu >= cut15 {
-						if isTx {
-							a.Tx15 += v.Bytes
-						} else {
-							a.Rx15 += v.Bytes
-						}
-					}
+					a.Tx1h += v.Bytes
+				}
+				if mu >= cut15 {
+					a.Tx15 += v.Bytes
+				}
+			} else {
+				a.Rx8h += v.Bytes
+				if mu >= cut1h {
+					a.Rx1h += v.Bytes
+				}
+				if mu >= cut15 {
+					a.Rx15 += v.Bytes
 				}
 			}
 		}
@@ -4478,19 +4851,31 @@ func ipTableHandler(w http.ResponseWriter, r *http.Request) {
 		}
 		// key format: SRC|DST|unixMinute
 		last := strings.LastIndex(k, "|")
-		if last <= 0 { continue }
+		if last <= 0 {
+			continue
+		}
 		rest := k[:last]
 		first := strings.Index(rest, "|")
-		if first <= 0 { continue }
+		if first <= 0 {
+			continue
+		}
 		src := rest[:first]
 		dst := rest[first+1:]
 		// reuse allowedCache from above to avoid repeated CIDR checks
 		allowedSrc, okS := allowedCache[src]
-		if !okS { allowedSrc = ipInLoggingPrefixes(src); allowedCache[src] = allowedSrc }
+		if !okS {
+			allowedSrc = ipInLoggingPrefixes(src)
+			allowedCache[src] = allowedSrc
+		}
 		if !allowedSrc {
 			allowedDst, okD := allowedCache[dst]
-			if !okD { allowedDst = ipInLoggingPrefixes(dst); allowedCache[dst] = allowedDst }
-			if !allowedDst { continue }
+			if !okD {
+				allowedDst = ipInLoggingPrefixes(dst)
+				allowedCache[dst] = allowedDst
+			}
+			if !allowedDst {
+				continue
+			}
 		}
 		sessionsTotal += cnt
 	}
@@ -4633,7 +5018,7 @@ async function loadPeers(ip){
   const seconds=windowSeconds(sort);
   const until=Math.floor(Date.now()/1000);
   const since=until-seconds;
-  const url='/api/ip/peers?ip='+encodeURIComponent(ip)+'&since='+since+'&until='+until+'&step=60&limit=100';
+  const url='/api/ip/peers?ip='+encodeURIComponent(ip)+'&since='+since+'&until='+until+'&step=300&limit=100';
   const r=await fetch(url);
   if(!r.ok){ console.error('peers http', r.status); return; }
   const data=await r.json();
@@ -4811,4 +5196,32 @@ setInterval(function(){
 </script>
 </body>
 </html>`))
+}
+
+// EnqueueOpenMany writes heartbeat/open-session entries (may have zero bytes/packets).
+func (t *tsdbWriter) EnqueueOpenMany(sessions []FlowSession) {
+	if t == nil || !t.enabled {
+		return
+	}
+	for i := range sessions {
+		s := sessions[i]
+		// src side
+		if p, line, ok := t.buildPathAndLine(true, s); ok {
+			sh := t.shardFor(p)
+			select {
+			case t.queues[sh] <- tsdbItem{path: p, line: line}:
+			default:
+				atomic.AddUint64(&t.dropped, 1)
+			}
+		}
+		// dst side
+		if p, line, ok := t.buildPathAndLine(false, s); ok {
+			sh := t.shardFor(p)
+			select {
+			case t.queues[sh] <- tsdbItem{path: p, line: line}:
+			default:
+				atomic.AddUint64(&t.dropped, 1)
+			}
+		}
+	}
 }
