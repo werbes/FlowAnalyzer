@@ -64,6 +64,7 @@ type FlowSession struct {
 	Start          time.Time `json:"start,omitempty"`
 	End            time.Time `json:"end,omitempty"`
 	Router         string    `json:"router"`
+	Routers        string    `json:"routers,omitempty"`
 	SrcIP          string    `json:"src_ip"`
 	SrcPort        int       `json:"src_port"`
 	DstIP          string    `json:"dst_ip"`
@@ -127,6 +128,20 @@ type Store struct {
 type sigOwner struct {
 	Router   string
 	LastSeen time.Time
+	Routers  []string
+}
+
+func appendUniqueRouter(list []string, r string) []string {
+	r = strings.TrimSpace(r)
+	if r == "" {
+		return list
+	}
+	for _, x := range list {
+		if strings.EqualFold(x, r) {
+			return list
+		}
+	}
+	return append(list, r)
 }
 
 // flowTrack keeps state for a long-lived flow to compute deltas and proper start/end times
@@ -234,7 +249,6 @@ func (t *tsdbWriter) Start(ctx context.Context) {
 
 func (t *tsdbWriter) runWorker(ctx context.Context, id int, in <-chan tsdbItem) {
 	files := make(map[string]*fileEntry)
-	made := make(map[string]struct{})
 	flushTicker := time.NewTicker(t.flushEvery)
 	defer flushTicker.Stop()
 	defer func() {
@@ -245,6 +259,39 @@ func (t *tsdbWriter) runWorker(ctx context.Context, id int, in <-chan tsdbItem) 
 			delete(files, p)
 		}
 	}()
+	lastMaint := time.Now()
+	doMaintenance := func() {
+		now := time.Now()
+		curHour := time.Now().UTC().Truncate(time.Hour)
+		for p, fe := range files {
+			_ = fe.w.Flush()
+			// Prefer fast-close for rotated (previous-hour) files to avoid Windows locks on moved/archived files
+			shouldClose := false
+			if rel, err := filepath.Rel(t.root, p); err == nil {
+				parts := strings.Split(rel, string(os.PathSeparator))
+				if len(parts) >= 4 {
+					y, errY := strconv.Atoi(parts[0])
+					m, errM := strconv.Atoi(parts[1])
+					d, errD := strconv.Atoi(parts[2])
+					hh, errH := strconv.Atoi(parts[3])
+					if errY == nil && errM == nil && errD == nil && errH == nil {
+						folderTime := time.Date(y, time.Month(m), d, hh, 0, 0, 0, time.UTC)
+						if folderTime.Before(curHour) && now.Sub(fe.lastUsed) >= 2*time.Second {
+							shouldClose = true
+						}
+					}
+				}
+			}
+			if !shouldClose {
+				shouldClose = now.Sub(fe.lastUsed) >= t.idleClose
+			}
+			if shouldClose {
+				_ = fe.f.Close()
+				delete(files, p)
+			}
+		}
+		lastMaint = now
+	}
 	for {
 		select {
 		case <-ctx.Done():
@@ -255,15 +302,12 @@ func (t *tsdbWriter) runWorker(ctx context.Context, id int, in <-chan tsdbItem) 
 			}
 			// ensure dir
 			dir := filepath.Dir(it.path)
-			if _, ok := made[dir]; !ok {
-				if err := os.MkdirAll(dir, 0o755); err != nil {
-					if t.logErrors {
-						log.Printf("TSDB mkdir error: %s: %v", dir, err)
-					}
-					// skip this item if we cannot create the directory
-					continue
+			if err := os.MkdirAll(dir, 0o755); err != nil {
+				if t.logErrors {
+					log.Printf("TSDB mkdir error: %s: %v", dir, err)
 				}
-				made[dir] = struct{}{}
+				// skip this item if we cannot create the directory
+				continue
 			}
 			// get file
 			fe := files[it.path]
@@ -290,15 +334,12 @@ func (t *tsdbWriter) runWorker(ctx context.Context, id int, in <-chan tsdbItem) 
 			}
 			fe.lastUsed = time.Now()
 			atomic.AddUint64(&t.accepted, 1)
-		case <-flushTicker.C:
-			now := time.Now()
-			for p, fe := range files {
-				_ = fe.w.Flush()
-				if now.Sub(fe.lastUsed) > t.idleClose {
-					_ = fe.f.Close()
-					delete(files, p)
-				}
+			// Opportunistic maintenance to avoid ticker starvation under load
+			if time.Since(lastMaint) >= t.flushEvery {
+				doMaintenance()
 			}
+		case <-flushTicker.C:
+			doMaintenance()
 		}
 	}
 }
@@ -415,9 +456,21 @@ func (t *tsdbWriter) buildPathAndLine(isSrc bool, s FlowSession) (string, []byte
 		endStr = "--:--:--"
 	}
 	// Enhanced line: "HH:MM:SS HH:MM:SS bytes packets proto srcIP:srcPort > dstIP:dstPort router=R\n"
+	// Router field enhancement: if s.Routers is populated, prefer it; otherwise try to look up
+	// historical routers from dedupOwners; fallback to s.Router.
+	routerVal := strings.TrimSpace(s.Router)
+	if strings.TrimSpace(s.Routers) != "" {
+		routerVal = strings.TrimSpace(s.Routers)
+	} else if dedupEnable {
+		if owner, ok := store.dedupOwners.Get(flowSig(s)); ok {
+			if len(owner.Routers) > 0 {
+				routerVal = strings.Join(owner.Routers, ",")
+			}
+		}
+	}
 	line := []byte(fmt.Sprintf("%s %s %d %d %s %s:%d > %s:%d router=%s\n",
 		startStr, endStr, s.Bytes, s.Packets,
-		strings.ToUpper(strings.TrimSpace(s.Protocol)), strings.TrimSpace(s.SrcIP), s.SrcPort, strings.TrimSpace(s.DstIP), s.DstPort, strings.TrimSpace(s.Router)))
+		strings.ToUpper(strings.TrimSpace(s.Protocol)), strings.TrimSpace(s.SrcIP), s.SrcPort, strings.TrimSpace(s.DstIP), s.DstPort, routerVal))
 	return p, line, true
 }
 
@@ -438,16 +491,26 @@ func NewStore() *Store {
 
 // internal configuration (populated in main)
 var (
-	retentionMinutes                = 15
-	flowTimeoutMinutes              = 10
+	retentionMinutes                = 5
+	flowTimeoutMinutes              = 2
 	aggregateOlderThanMinutes       = 0
 	aggregateBucketSeconds          = 60
 	compactEverySeconds             = 30
 	maxSessionsBeforeCompactTrigger = 50000
 
+	// Metrics summaries retention (hours) for ip/proto/pair minute maps
+	summariesRetentionHours = 8
+
+	// UDP collector concurrency controls (bounded)
+	collectorWorkers = runtime.GOMAXPROCS(0) * 2
+	collectorQueue   = 8192
+
+	// Max concurrent WebSocket log feed connections
+	wsMaxConns = 200
+
 	// Cross-router dedup configuration
-	dedupEnable = false
-	dedupTTL    = 15 * time.Minute
+	dedupEnable = true
+	dedupTTL    = 1 * time.Minute
 )
 
 func (s *Store) AddMany(items []FlowSession) int {
@@ -506,11 +569,20 @@ func (s *Store) AddMany(items []FlowSession) int {
 		case newSessionsChan <- s:
 		default:
 		}
+		// If this record finalized the session, also notify end for live removal
+		if !s.End.IsZero() && !s.OpenEnd {
+			select {
+			case endedSessionsChan <- s:
+			default:
+			}
+		}
 	}
 	return len(tracked)
 }
 
 // applyDedup filters a batch to keep only sessions owned by a single router per 5-tuple within a TTL.
+// Additionally, it records the set of routers observed for the flow signature and populates FlowSession.Routers
+// for accepted sessions so consumers can see the historical path across routers/ISPs.
 func (s *Store) applyDedup(items []FlowSession) []FlowSession {
 	now := time.Now()
 	acc := make([]FlowSession, 0, len(items))
@@ -522,23 +594,35 @@ func (s *Store) applyDedup(items []FlowSession) []FlowSession {
 		}
 		sig := flowSig(fs)
 		allowed := false
-		s.dedupOwners.Upsert(sig, sigOwner{Router: fs.Router, LastSeen: now}, func(exist bool, cur, newVal sigOwner) sigOwner {
+		s.dedupOwners.Upsert(sig, sigOwner{Router: fs.Router, LastSeen: now, Routers: []string{fs.Router}}, func(exist bool, cur, newVal sigOwner) sigOwner {
 			if !exist || now.Sub(cur.LastSeen) > dedupTTL {
-				// No owner or expired -> claim ownership for this router
+				// No owner or expired -> claim ownership for this router and reset history
 				allowed = true
-				return sigOwner{Router: fs.Router, LastSeen: now}
+				return sigOwner{Router: fs.Router, LastSeen: now, Routers: []string{fs.Router}}
 			}
+			// Always record this router in history
+			cur.Routers = appendUniqueRouter(cur.Routers, fs.Router)
 			if cur.Router == fs.Router {
 				// Same owner -> accept and refresh last seen
 				allowed = true
 				cur.LastSeen = now
 				return cur
 			}
-			// Different router owns and not expired -> drop
+			// Different router owns and not expired -> drop (keep history; do NOT refresh last seen to allow ownership to expire)
 			allowed = false
 			return cur
 		})
 		if allowed {
+			// Populate historical routers string (comma-separated) for visibility
+			if owner, ok := s.dedupOwners.Get(sig); ok {
+				if len(owner.Routers) > 0 {
+					fs.Routers = strings.Join(owner.Routers, ",")
+				} else {
+					fs.Routers = fs.Router
+				}
+			} else {
+				fs.Routers = fs.Router
+			}
 			acc = append(acc, fs)
 		}
 	}
@@ -811,6 +895,50 @@ func (s *Store) StartMaintenance(ctx context.Context) {
 			}
 		}
 	}()
+
+	// Idle-timeout sweeper: finalize and remove inactive flow states so live sessions don't get stuck
+	go func() {
+		// Sweep every 30 seconds
+		tick := time.NewTicker(30 * time.Second)
+		defer tick.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-tick.C:
+				// If timeout disabled or non-positive, skip
+				if flowTimeoutMinutes <= 0 {
+					continue
+				}
+				cutoff := time.Now().Add(-time.Duration(flowTimeoutMinutes) * time.Minute)
+				for k, st := range s.flowStates.Items() {
+					if st.LastExport.Before(cutoff) {
+						fs, ok := flowSessionFromKey(k, st)
+						// Remove state first to avoid double handling
+						s.flowStates.Remove(k)
+						if !ok {
+							continue
+						}
+						// Build a minimal final session for UI removal
+						fs.Timestamp = st.LastExport
+						fs.Start = st.Start
+						fs.End = st.LastExport
+						// Prefer historical router path if available
+						sig := flowSig(fs)
+						if owner, ok := s.dedupOwners.Get(sig); ok {
+							if len(owner.Routers) > 0 {
+								fs.Routers = strings.Join(owner.Routers, ",")
+							}
+						}
+						select {
+						case endedSessionsChan <- fs:
+						default:
+						}
+					}
+				}
+			}
+		}
+	}()
 }
 
 type Query struct {
@@ -927,6 +1055,9 @@ var newSessionsChan = make(chan FlowSession, 1024)
 // WebSocket live feed state
 var wsUpgrader = websocket.Upgrader{CheckOrigin: func(r *http.Request) bool { return true }}
 
+// endedSessionsChan carries sessions that have completed, so live views can remove them.
+var endedSessionsChan = make(chan FlowSession, 1024)
+
 type wsFilter struct {
 	IP      string
 	Side    string // both|src|dst
@@ -938,8 +1069,32 @@ type wsFilter struct {
 	DstPort int
 }
 
+// Connections for /ws/logs (log tail)
 var wsMu sync.RWMutex
 var wsConns = make(map[*websocket.Conn]wsFilter)
+
+// Connections for /ws/sessions (live sessions)
+var wsSessMu sync.RWMutex
+var wsSessConns = make(map[*websocket.Conn]wsFilter)
+
+type wsSessRow struct {
+	Start    string `json:"start"`
+	Last     string `json:"last"`
+	Protocol string `json:"protocol"`
+	SrcIP    string `json:"src_ip"`
+	SrcPort  int    `json:"src_port"`
+	DstIP    string `json:"dst_ip"`
+	DstPort  int    `json:"dst_port"`
+	Bytes    int64  `json:"bytes"`
+	Packets  int64  `json:"packets"`
+	Router   string `json:"router"`
+}
+
+type wsSessEvent struct {
+	Event   string    `json:"event"` // add|end
+	Key     string    `json:"key"`
+	Session wsSessRow `json:"session,omitempty"`
+}
 
 func wsStart(ctx context.Context) {
 	go func() {
@@ -948,7 +1103,7 @@ func wsStart(ctx context.Context) {
 			case <-ctx.Done():
 				return
 			case s := <-newSessionsChan:
-				// Snapshot clients under lock
+				// Snapshot clients under lock for logs feed
 				wsMu.RLock()
 				targets := make([]struct {
 					Conn   *websocket.Conn
@@ -981,6 +1136,109 @@ func wsStart(ctx context.Context) {
 						delete(wsConns, c)
 					}
 					wsMu.Unlock()
+				}
+
+				// Broadcast to live sessions clients as an 'add' event (update/create)
+				wsSessMu.RLock()
+				sTargets := make([]struct {
+					Conn   *websocket.Conn
+					Filter wsFilter
+				}, 0, len(wsSessConns))
+				for c, f := range wsSessConns {
+					sTargets = append(sTargets, struct {
+						Conn   *websocket.Conn
+						Filter wsFilter
+					}{Conn: c, Filter: f})
+				}
+				wsSessMu.RUnlock()
+				var sessToRemove []*websocket.Conn
+				for _, t := range sTargets {
+					if !wsMatches(t.Filter, s) {
+						continue
+					}
+					row := wsSessRow{
+						Start: func() string {
+							st := s.Start
+							if st.IsZero() {
+								st = s.Timestamp
+							}
+							return st.UTC().Format(time.RFC3339)
+						}(),
+						Last:     s.Timestamp.UTC().Format(time.RFC3339),
+						Protocol: strings.ToUpper(s.Protocol),
+						SrcIP:    s.SrcIP,
+						SrcPort:  s.SrcPort,
+						DstIP:    s.DstIP,
+						DstPort:  s.DstPort,
+						Bytes: func() int64 {
+							if s.Bytes < 0 {
+								return 0
+							}
+							return s.Bytes
+						}(),
+						Packets: func() int64 {
+							if s.Packets < 0 {
+								return 0
+							}
+							return s.Packets
+						}(),
+						Router: func() string {
+							if strings.TrimSpace(s.Routers) != "" {
+								return s.Routers
+							}
+							return s.Router
+						}(),
+					}
+					// Skip zero-total sessions to avoid cluttering the live view
+					if row.Bytes <= 0 && row.Packets <= 0 {
+						continue
+					}
+					ev := wsSessEvent{Event: "add", Key: wsSessKey(s), Session: row}
+					_ = t.Conn.SetWriteDeadline(time.Now().Add(5 * time.Second))
+					if err := t.Conn.WriteJSON(ev); err != nil {
+						sessToRemove = append(sessToRemove, t.Conn)
+					}
+				}
+				if len(sessToRemove) > 0 {
+					wsSessMu.Lock()
+					for _, c := range sessToRemove {
+						_ = c.Close()
+						delete(wsSessConns, c)
+					}
+					wsSessMu.Unlock()
+				}
+			case s := <-endedSessionsChan:
+				// Broadcast 'end' event to live sessions clients so they can remove rows
+				wsSessMu.RLock()
+				sTargets := make([]struct {
+					Conn   *websocket.Conn
+					Filter wsFilter
+				}, 0, len(wsSessConns))
+				for c, f := range wsSessConns {
+					sTargets = append(sTargets, struct {
+						Conn   *websocket.Conn
+						Filter wsFilter
+					}{Conn: c, Filter: f})
+				}
+				wsSessMu.RUnlock()
+				var sessToRemove2 []*websocket.Conn
+				for _, t := range sTargets {
+					if !wsMatches(t.Filter, s) {
+						continue
+					}
+					ev := wsSessEvent{Event: "end", Key: wsSessKey(s)}
+					_ = t.Conn.SetWriteDeadline(time.Now().Add(5 * time.Second))
+					if err := t.Conn.WriteJSON(ev); err != nil {
+						sessToRemove2 = append(sessToRemove2, t.Conn)
+					}
+				}
+				if len(sessToRemove2) > 0 {
+					wsSessMu.Lock()
+					for _, c := range sessToRemove2 {
+						_ = c.Close()
+						delete(wsSessConns, c)
+					}
+					wsSessMu.Unlock()
 				}
 			}
 		}
@@ -1039,6 +1297,11 @@ func fsLogItemFromSession(ip string, s FlowSession) fsLogItem {
 			side = "dst"
 		}
 	}
+	// Prefer Routers (historical path) if present; fallback to single Router for compatibility
+	rval := s.Router
+	if strings.TrimSpace(s.Routers) != "" {
+		rval = s.Routers
+	}
 	return fsLogItem{
 		Start:    start.UTC().Format(time.RFC3339),
 		End:      end.UTC().Format(time.RFC3339),
@@ -1049,7 +1312,7 @@ func fsLogItemFromSession(ip string, s FlowSession) fsLogItem {
 		SrcPort:  s.SrcPort,
 		DstIP:    s.DstIP,
 		DstPort:  s.DstPort,
-		Router:   s.Router,
+		Router:   rval,
 		Side:     side,
 	}
 }
@@ -1076,6 +1339,19 @@ func main() {
 	if n, err := strconv.Atoi(getenv("MAX_SESSIONS_TRIGGER", fmt.Sprintf("%d", maxSessionsBeforeCompactTrigger))); err == nil {
 		maxSessionsBeforeCompactTrigger = n
 	}
+	// New safeguards tunables
+	if n, err := strconv.Atoi(getenv("METRICS_RETENTION_HOURS", fmt.Sprintf("%d", summariesRetentionHours))); err == nil {
+		summariesRetentionHours = n
+	}
+	if n, err := strconv.Atoi(getenv("COLLECTOR_WORKERS", fmt.Sprintf("%d", collectorWorkers))); err == nil {
+		collectorWorkers = n
+	}
+	if n, err := strconv.Atoi(getenv("COLLECTOR_QUEUE", fmt.Sprintf("%d", collectorQueue))); err == nil {
+		collectorQueue = n
+	}
+	if n, err := strconv.Atoi(getenv("WS_MAX_CONNS", fmt.Sprintf("%d", wsMaxConns))); err == nil {
+		wsMaxConns = n
+	}
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthz", healthHandler)
@@ -1095,8 +1371,11 @@ func main() {
 	mux.HandleFunc("/api/ip_table", ipTableHandler)
 	// New UI page for dedicated log search window
 	mux.HandleFunc("/logs", logsPageHandler)
-	// WebSocket endpoint for live log feed matching filters
+	// New UI page for live sessions view
+	mux.HandleFunc("/live", liveSessionsPageHandler)
+	// WebSocket endpoints for live feeds
 	mux.HandleFunc("/ws/logs", wsLogsHandler)
+	mux.HandleFunc("/ws/sessions", wsSessionsHandler)
 	mux.HandleFunc("/", ipTableIndexHandler)
 
 	// Optional pprof endpoints
@@ -1128,9 +1407,9 @@ func main() {
 
 	// Configure cross-router dedup from environment
 	dedupEnable = getenvBool("DEDUP_ENABLE", true)
-	ttlMin := getenvInt("DEDUP_TTL_MIN", 15)
+	ttlMin := getenvInt("DEDUP_TTL_MIN", 1)
 	if ttlMin <= 0 {
-		ttlMin = 15
+		ttlMin = 1
 	}
 	dedupTTL = time.Duration(ttlMin) * time.Minute
 	log.Printf("Dedup: enabled=%v ttl=%s", dedupEnable, dedupTTL.String())
@@ -2527,6 +2806,7 @@ func scanIPLogs(root string, ip string, since, until time.Time, side string, fil
 			if err != nil {
 				continue
 			}
+			defer f.Close()
 			sc := bufio.NewScanner(f)
 			for sc.Scan() {
 				line := strings.TrimSpace(sc.Text())
@@ -2726,6 +3006,8 @@ func logsSearchHandler(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
+	// Collapse duplicate entries representing the same session across routers
+	items = collapseLogItems(items)
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(map[string]any{
 		"ip":        ip,
@@ -2882,6 +3164,7 @@ func wsLogsHandler(w http.ResponseWriter, r *http.Request) {
 		}
 		// Use a high limit to stream all items in the window.
 		if items, _, err := scanIPLogs(root, f.IP, since, until, side, filters, 0, 1_000_000); err == nil {
+			items = collapseLogItems(items)
 			for _, it := range items {
 				_ = c.SetWriteDeadline(time.Now().Add(5 * time.Second))
 				if err := c.WriteJSON(it); err != nil {
@@ -2895,6 +3178,12 @@ func wsLogsHandler(w http.ResponseWriter, r *http.Request) {
 	// If end time is in the future, subscribe to live updates; otherwise, close the socket.
 	if until.After(time.Now()) {
 		wsMu.Lock()
+		if wsMaxConns > 0 && len(wsConns) >= wsMaxConns {
+			wsMu.Unlock()
+			_ = c.WriteControl(websocket.CloseMessage, websocket.FormatCloseMessage(websocket.CloseTryAgainLater, "too many connections"), time.Now().Add(1*time.Second))
+			_ = c.Close()
+			return
+		}
 		wsConns[c] = f
 		wsMu.Unlock()
 		// Read pump to detect close and cleanup
@@ -2911,6 +3200,131 @@ func wsLogsHandler(w http.ResponseWriter, r *http.Request) {
 		_ = c.WriteControl(websocket.CloseMessage, websocket.FormatCloseMessage(websocket.CloseNormalClosure, ""), time.Now().Add(1*time.Second))
 		_ = c.Close()
 	}
+}
+
+// wsSessionsHandler upgrades to WebSocket and subscribes the client to live session updates (add/end),
+// applying the same filter semantics as /ws/logs. Sends a snapshot of current active sessions first.
+func wsSessionsHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	c, err := wsUpgrader.Upgrade(w, r, nil)
+	if err != nil {
+		return
+	}
+	q := r.URL.Query()
+	parsePort := func(keys ...string) int {
+		for _, k := range keys {
+			v := strings.TrimSpace(q.Get(k))
+			if v != "" {
+				if n, err := strconv.Atoi(v); err == nil {
+					return n
+				}
+			}
+		}
+		return 0
+	}
+	f := wsFilter{
+		IP:   strings.TrimSpace(q.Get("ip")),
+		Side: strings.ToLower(strings.TrimSpace(q.Get("side"))),
+		Src:  strings.TrimSpace(q.Get("src")),
+		Dst:  strings.TrimSpace(q.Get("dst")),
+		Proto: normalizeProto(strings.TrimSpace(func() string {
+			v := q.Get("protocol")
+			if v == "" {
+				v = q.Get("proto")
+			}
+			return v
+		}())),
+		Port:    parsePort("port"),
+		SrcPort: parsePort("src_port", "src-port"),
+		DstPort: parsePort("dst_port", "dst-port"),
+	}
+
+	// Send initial snapshot of currently active sessions from in-memory state.
+	// We iterate a copy of the items from the concurrent map to avoid holding locks during writes.
+	for k, st := range store.flowStates.Items() {
+		fs, ok := flowSessionFromKey(k, st)
+		if !ok {
+			continue
+		}
+		// Populate running totals and last timestamp
+		fs.Timestamp = st.LastExport
+		fs.Bytes = st.SumBytes
+		fs.Packets = st.SumPkts
+		// Prefer historical routers path if known via dedup owners
+		sig := flowSig(fs)
+		if owner, ok := store.dedupOwners.Get(sig); ok {
+			if len(owner.Routers) > 0 {
+				fs.Routers = strings.Join(owner.Routers, ",")
+			} else {
+				fs.Routers = fs.Router
+			}
+		}
+		if !wsMatches(f, fs) {
+			continue
+		}
+		row := wsSessRow{
+			Start: func() string {
+				stt := fs.Start
+				if stt.IsZero() {
+					stt = fs.Timestamp
+				}
+				return stt.UTC().Format(time.RFC3339)
+			}(),
+			Last:     fs.Timestamp.UTC().Format(time.RFC3339),
+			Protocol: strings.ToUpper(fs.Protocol),
+			SrcIP:    fs.SrcIP,
+			SrcPort:  fs.SrcPort,
+			DstIP:    fs.DstIP,
+			DstPort:  fs.DstPort,
+			Bytes: func() int64 {
+				if fs.Bytes < 0 {
+					return 0
+				}
+				return fs.Bytes
+			}(),
+			Packets: func() int64 {
+				if fs.Packets < 0 {
+					return 0
+				}
+				return fs.Packets
+			}(),
+			Router: func() string {
+				if strings.TrimSpace(fs.Routers) != "" {
+					return fs.Routers
+				}
+				return fs.Router
+			}(),
+		}
+		ev := wsSessEvent{Event: "add", Key: wsSessKey(fs), Session: row}
+		_ = c.SetWriteDeadline(time.Now().Add(5 * time.Second))
+		if err := c.WriteJSON(ev); err != nil {
+			_ = c.Close()
+			return
+		}
+	}
+
+	// Register connection for live updates after snapshot
+	wsSessMu.Lock()
+	if wsMaxConns > 0 && len(wsSessConns) >= wsMaxConns {
+		wsSessMu.Unlock()
+		_ = c.WriteControl(websocket.CloseMessage, websocket.FormatCloseMessage(websocket.CloseTryAgainLater, "too many connections"), time.Now().Add(1*time.Second))
+		_ = c.Close()
+		return
+	}
+	wsSessConns[c] = f
+	wsSessMu.Unlock()
+	// Read pump
+	go func(conn *websocket.Conn) {
+		defer func() { wsSessMu.Lock(); delete(wsSessConns, conn); wsSessMu.Unlock(); _ = conn.Close() }()
+		for {
+			if _, _, err := conn.ReadMessage(); err != nil {
+				return
+			}
+		}
+	}(c)
 }
 
 func getenv(k, def string) string {
@@ -3072,7 +3486,7 @@ func adjustBaseTime(exportTime time.Time, recvTime time.Time) (base time.Time, s
 	return exportTime, 0, false
 }
 
-// startUDPCollectorWithWorkers starts a UDP listener and processes each received datagram in its own goroutine (no worker pool).
+// startUDPCollectorWithWorkers starts a UDP listener and processes packets with a bounded worker pool to cap memory usage.
 func startUDPCollectorWithWorkers(ctx context.Context, addr, name string) {
 	udpAddr, err := net.ResolveUDPAddr("udp", addr)
 	if err != nil {
@@ -3084,11 +3498,36 @@ func startUDPCollectorWithWorkers(ctx context.Context, addr, name string) {
 		log.Printf("%s listen error: %v", strings.ToLower(name), err)
 		return
 	}
-	log.Printf("%s UDP collector listening on %s", name, addr)
+	log.Printf("%s UDP collector listening on %s (workers=%d queue=%d)", name, addr, collectorWorkers, collectorQueue)
 	go func() {
 		<-ctx.Done()
 		_ = conn.Close()
 	}()
+
+	type udpPacket struct {
+		data []byte
+		src  *net.UDPAddr
+		recv time.Time
+	}
+	queue := make(chan udpPacket, collectorQueue)
+	// Start workers
+	for i := 0; i < collectorWorkers; i++ {
+		go func(id int) {
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case pkt := <-queue:
+					records := parseNetFlowPacket(pkt.data, pkt.src, pkt.recv)
+					if len(records) == 0 {
+						continue
+					}
+					fillCountries(records)
+					store.AddMany(records)
+				}
+			}
+		}(i)
+	}
 
 	buf := make([]byte, 65535)
 	for {
@@ -3110,16 +3549,12 @@ func startUDPCollectorWithWorkers(ctx context.Context, addr, name string) {
 		recvTime := time.Now()
 		b := make([]byte, n)
 		copy(b, buf[:n])
-		// Process each received packet in its own goroutine; handle all flows within the packet
-		// to minimize per-flow overhead and avoid any worker pool/queue.
-		go func(data []byte, src *net.UDPAddr, recv time.Time) {
-			records := parseNetFlowPacket(data, src, recv)
-			if len(records) == 0 {
-				return
-			}
-			fillCountries(records)
-			store.AddMany(records)
-		}(b, src, recvTime)
+		pkt := udpPacket{data: b, src: src, recv: recvTime}
+		select {
+		case <-ctx.Done():
+			return
+		case queue <- pkt:
+		}
 	}
 }
 
@@ -3755,7 +4190,25 @@ func flowKey(s FlowSession) string {
 // flowSig builds a cross-router deduplication signature for a directional flow (5-tuple)
 func flowSig(s FlowSession) string {
 	// Note: do not include Router or interfaces here; we deduplicate across routers
-	return fmt.Sprintf("%s|%d|%s|%d|%s", s.SrcIP, s.SrcPort, s.DstIP, s.DstPort, s.Protocol)
+	// Normalize protocol and treat ICMP families as portless to avoid duplicate rows across exporters
+	proto := strings.ToUpper(strings.TrimSpace(s.Protocol))
+	srcPort := s.SrcPort
+	dstPort := s.DstPort
+	if proto == "ICMP" || proto == "ICMPV6" {
+		srcPort = 0
+		dstPort = 0
+	}
+	return fmt.Sprintf("%s|%d|%s|%d|%s", s.SrcIP, srcPort, s.DstIP, dstPort, proto)
+}
+
+// wsSessKey returns the key used for WebSocket live session updates. When dedup
+// is enabled, we want a single row per flow signature regardless of router, so
+// we use flowSig. Otherwise, fall back to flowKey (includes router).
+func wsSessKey(s FlowSession) string {
+	if dedupEnable {
+		return flowSig(s)
+	}
+	return flowKey(s)
 }
 
 // flowSessionFromKey reconstructs a FlowSession identity from a flowKey and flowTrack state.
@@ -3901,7 +4354,11 @@ func (s *Store) indexAndSummarize(items []FlowSession) {
 
 // pruneSummaries removes minute summary keys older than 8 hours.
 func (s *Store) pruneSummaries() {
-	cut := time.Now().Add(-8 * time.Hour).UTC().Truncate(time.Minute).Unix()
+	retH := summariesRetentionHours
+	if retH <= 0 {
+		retH = 8
+	}
+	cut := time.Now().Add(-time.Duration(retH) * time.Hour).UTC().Truncate(time.Minute).Unix()
 	for k := range s.ipMinuteTx.Items() {
 		if m, ok := minuteFromKey(k); ok && m < cut {
 			s.ipMinuteTx.Remove(k)
@@ -3984,6 +4441,10 @@ func (s *Store) pruneSummaries() {
 		for _, sfs := range expired {
 			select {
 			case newSessionsChan <- sfs:
+			default:
+			}
+			select {
+			case endedSessionsChan <- sfs:
 			default:
 			}
 		}
@@ -5054,8 +5515,10 @@ async function load(){
     const ipTd=document.createElement('td');
     const a=document.createElement('a'); a.href='#'; a.textContent=it.ip; a.addEventListener('click', function(e){ e.preventDefault(); const url='/logs?src='+encodeURIComponent(it.ip)+'&autoscroll=1'; window.open(url, '_blank'); });
     const peersBtn=document.createElement('button'); peersBtn.textContent='Peers'; peersBtn.style.marginLeft='.4rem'; peersBtn.addEventListener('click', function(e){ e.preventDefault(); setParam('ip', it.ip); loadPeers(it.ip); });
+    const liveBtn=document.createElement('button'); liveBtn.textContent='Live Sessions'; liveBtn.style.marginLeft='.4rem'; liveBtn.addEventListener('click', function(e){ e.preventDefault(); const url='/live?src='+encodeURIComponent(it.ip); window.open(url, '_blank'); });
     ipTd.appendChild(a);
     ipTd.appendChild(peersBtn);
+    ipTd.appendChild(liveBtn);
     tr.appendChild(ipTd);
     tr.appendChild(td(it.country || ''));
     tr.appendChild(td(fmtBytes(it.tx_15m)));
@@ -5224,4 +5687,165 @@ func (t *tsdbWriter) EnqueueOpenMany(sessions []FlowSession) {
 			}
 		}
 	}
+}
+
+// collapseLogItems merges duplicate log items representing the same session across routers.
+func collapseLogItems(items []fsLogItem) []fsLogItem {
+	if len(items) <= 1 {
+		return items
+	}
+	type key struct {
+		Side     string
+		Start    string
+		End      string
+		Protocol string
+		SrcIP    string
+		SrcPort  int
+		DstIP    string
+		DstPort  int
+	}
+	idxMap := make(map[key]int, len(items))
+	out := make([]fsLogItem, 0, len(items))
+	for _, it := range items {
+		k := key{
+			Side:     strings.TrimSpace(it.Side),
+			Start:    it.Start,
+			End:      it.End,
+			Protocol: strings.ToUpper(strings.TrimSpace(it.Protocol)),
+			SrcIP:    it.SrcIP,
+			SrcPort:  it.SrcPort,
+			DstIP:    it.DstIP,
+			DstPort:  it.DstPort,
+		}
+		if i, ok := idxMap[k]; ok {
+			cur := &out[i]
+			// Merge routers unique
+			routers := make([]string, 0, 4)
+			if strings.TrimSpace(cur.Router) != "" {
+				for _, r := range strings.Split(cur.Router, ",") {
+					routers = appendUniqueRouter(routers, strings.TrimSpace(r))
+				}
+			}
+			if strings.TrimSpace(it.Router) != "" {
+				for _, r := range strings.Split(it.Router, ",") {
+					routers = appendUniqueRouter(routers, strings.TrimSpace(r))
+				}
+			}
+			cur.Router = strings.Join(routers, ",")
+			if it.Bytes > cur.Bytes {
+				cur.Bytes = it.Bytes
+			}
+			if it.Packets > cur.Packets {
+				cur.Packets = it.Packets
+			}
+			// keep Start/End of first occurrence for stability
+			continue
+		}
+		it.Router = strings.TrimSpace(it.Router)
+		out = append(out, it)
+		idxMap[k] = len(out) - 1
+	}
+	return out
+}
+
+// liveSessionsPageHandler serves a dedicated page for real-time session view with filters similar to /logs.
+func liveSessionsPageHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	_, _ = w.Write([]byte(`<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1"/>
+<title>FlowAnalyzer - Live Sessions</title>
+<style>
+ body{font-family:system-ui,Segoe UI,Roboto,Arial,sans-serif;margin:0;background:#0b1020;color:#e6edf3}
+ header, .controls{padding:1rem 1.25rem;border-bottom:1px solid #22283d;display:flex;gap:.5rem;align-items:center;flex-wrap:wrap}
+ table{width:100%;border-collapse:collapse;background:#141a2f;border:1px solid #22283d;border-radius:10px;margin:1rem;overflow:hidden}
+ th,td{padding:.4rem .5rem;border-bottom:1px solid #22283d;text-align:right}
+ th:first-child, td:first-child{text-align:left}
+ small.m{color:#8b96b1}
+ select,input,button{background:#0f1529;color:#e6edf3;border:1px solid #253055;border-radius:6px;padding:.35rem .5rem}
+ .muted{color:#8b96b1}
+ .nowrap{white-space:nowrap}
+</style>
+</head>
+<body>
+<header><h1 style="font-size:1rem;margin:0;color:#cbd4e6">Live Sessions</h1><small class="m">Real-time view</small></header>
+<div id="controls" class="controls">
+  <label>IP <input id="fIP" style="width:160px" placeholder="optional"/></label>
+  <label>Side <select id="fSide"><option value="both" selected>both</option><option value="src">src</option><option value="dst">dst</option></select></label>
+  <label>Src <input id="fSrc" style="width:160px"/></label>
+  <label>Dst <input id="fDst" style="width:160px"/></label>
+  <label>Proto <input id="fProto" style="width:80px"/></label>
+  <label>Port <input id="fPort" style="width:80px"/></label>
+  <button id="apply">Apply</button>
+</div>
+<div class="muted" style="padding:0 1.25rem;">Rows appear as sessions are observed. They update live and are removed when sessions end.</div>
+<table id="sessTbl"><thead><tr>
+  <th class="nowrap">Start</th><th class="nowrap">Last</th><th>Proto</th><th>Src</th><th>Dst</th><th>Bytes</th><th>Pkts</th><th>Router</th>
+</tr></thead><tbody></tbody></table>
+<script>
+(function(){
+  function qs(name){ try{ return new URLSearchParams(location.search).get(name)||''; }catch(e){ return ''; } }
+  function buildWSURL(){ const p=new URLSearchParams(); const ip=(document.getElementById('fIP').value||'').trim(); const side=document.getElementById('fSide').value; const src=(document.getElementById('fSrc').value||'').trim(); const dst=(document.getElementById('fDst').value||'').trim(); const proto=(document.getElementById('fProto').value||'').trim(); const port=(document.getElementById('fPort').value||'').trim(); if(ip) p.set('ip', ip); if(side && side!=='both') p.set('side', side); if(src) p.set('src', src); if(dst) p.set('dst', dst); if(proto) p.set('protocol', proto); if(port) p.set('port', port); const wsProto=(location.protocol==='https:')?'wss':'ws'; return wsProto+'://'+location.host+'/ws/sessions?'+p.toString(); }
+  function td(t){ const d=document.createElement('td'); d.textContent=t; return d; }
+  const tbody = document.querySelector('#sessTbl tbody');
+  const rows = new Map(); // key -> {tr, bytes, packets}
+  const ttlMs = 180000; // safety: remove stale rows after 3 minutes without updates
+  function fmtAddr(ip, port){ return ip + (port?(':'+port):''); }
+  function mergeRouters(a, b){
+    const s = new Set();
+    (String(a||'').split(',')).forEach(r=>{ r=r.trim(); if(r) s.add(r); });
+    (String(b||'').split(',')).forEach(r=>{ r=r.trim(); if(r) s.add(r); });
+    return Array.from(s).join(',');
+  }
+  function onAdd(ev){
+    const k=ev.key; const s=ev.session||{}; let row=rows.get(k);
+    if(!row){
+      const tr=document.createElement('tr'); tr.dataset.key=k;
+      tr.appendChild(td(s.start||'')); tr.appendChild(td(s.last||'')); tr.appendChild(td(s.protocol||''));
+      tr.appendChild(td(fmtAddr(s.src_ip||'', s.src_port||0))); tr.appendChild(td(fmtAddr(s.dst_ip||'', s.dst_port||0)));
+      tr.appendChild(td(String(s.bytes||0))); tr.appendChild(td(String(s.packets||0))); tr.appendChild(td(s.router||''));
+      tbody.appendChild(tr);
+      row={tr:tr, bytes:(s.bytes||0), packets:(s.packets||0)}; rows.set(k,row);
+    } else {
+      row.bytes += (s.bytes||0); row.packets += (s.packets||0);
+      const tds=row.tr.children;
+      if(tds&&tds.length>=8){
+        // update Last
+        tds[1].textContent = s.last||tds[1].textContent;
+        // earliest Start
+        if(s.start){ const cur=Date.parse(tds[0].textContent||''); const inc=Date.parse(s.start); if(!isNaN(inc) && (isNaN(cur) || inc < cur)){ tds[0].textContent = s.start; } }
+        // merge routers
+        tds[7].textContent = mergeRouters(tds[7].textContent, s.router||'');
+        // totals
+        tds[5].textContent = String(row.bytes); tds[6].textContent = String(row.packets);
+      }
+    }
+  }
+  function onEnd(ev){ const k=ev.key; const row=rows.get(k); if(row){ row.tr.remove(); rows.delete(k); } }
+  function sweepStale(){
+    const now=Date.now();
+    rows.forEach((row,k)=>{
+      const tds=row.tr.children; if(!tds||tds.length<8) return;
+      const last=Date.parse(tds[1].textContent||'');
+      if(!isNaN(last) && now-last>ttlMs){ row.tr.remove(); rows.delete(k); }
+    });
+  }
+  setInterval(sweepStale, 30000);
+  let ws=null; function openWS(){ try{ if(ws){ ws.close(); } // reset state
+    rows.forEach((v)=>v.tr.remove()); rows.clear();
+    const url = buildWSURL(); ws = new WebSocket(url); ws.onmessage=function(e){ try{ const ev=JSON.parse(e.data); if(ev && ev.event==='add'){ onAdd(ev); } else if(ev && ev.event==='end'){ onEnd(ev); } }catch(err){} };
+    ws.onopen=function(){}; ws.onerror=function(){}; ws.onclose=function(){};
+  }catch(e){} }
+  function init(){ document.getElementById('fIP').value = qs('ip')||qs('src')||''; document.getElementById('fSrc').value = qs('src')||''; document.getElementById('fDst').value = qs('dst')||''; document.getElementById('fProto').value = qs('protocol')||qs('proto')||''; document.getElementById('fPort').value = qs('port')||''; const side=qs('side'); if(side){ const el=document.getElementById('fSide'); for(let i=0;i<el.options.length;i++){ if(el.options[i].value===side){ el.selectedIndex=i; break; } } } openWS(); }
+  window.addEventListener('DOMContentLoaded', function(){ document.getElementById('apply').addEventListener('click', openWS); ['fIP','fSide','fSrc','fDst','fProto','fPort'].forEach(function(id){ const el=document.getElementById(id); if(el){ el.addEventListener('change', openWS); } }); init(); });
+})();
+</script>
+</body>
+</html>`))
 }

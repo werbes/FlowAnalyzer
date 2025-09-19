@@ -55,8 +55,11 @@ func (f *flowSvc) Execute(args []string, r <-chan svc.ChangeRequest, s chan<- sv
 	mux.HandleFunc("/api/ip_table", ipTableHandler)
 	// New UI page for dedicated log search window
 	mux.HandleFunc("/logs", logsPageHandler)
+	// Live sessions page and WebSocket endpoints
+	mux.HandleFunc("/live", liveSessionsPageHandler)
 	// WebSocket endpoint for live log feed
 	mux.HandleFunc("/ws/logs", wsLogsHandler)
+	mux.HandleFunc("/ws/sessions", wsSessionsHandler)
 	mux.HandleFunc("/", ipTableIndexHandler)
 
 	var handler http.Handler = mux
@@ -77,9 +80,12 @@ func (f *flowSvc) Execute(args []string, r <-chan svc.ChangeRequest, s chan<- sv
 	// Start store maintenance
 	store.StartMaintenance(bgCtx)
 
+	// Start WebSocket broadcaster for live feeds (/ws/logs and /ws/sessions)
+	wsStart(bgCtx)
+
 	// Configure cross-router dedup from environment
 	dedupEnable = getenvBool("DEDUP_ENABLE", true)
-	if ttlMin := getenvInt("DEDUP_TTL_MIN", 15); ttlMin > 0 {
+	if ttlMin := getenvInt("DEDUP_TTL_MIN", 1); ttlMin > 0 {
 		dedupTTL = time.Duration(ttlMin) * time.Minute
 	}
 	log.Printf("[svc] Dedup: enabled=%v ttl=%s", dedupEnable, dedupTTL.String())
