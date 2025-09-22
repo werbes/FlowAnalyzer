@@ -1369,10 +1369,14 @@ func main() {
 	mux.HandleFunc("/api/ips", ipsHandler)
 	mux.HandleFunc("/api/ip", ipViewHandler)
 	mux.HandleFunc("/api/ip_table", ipTableHandler)
+	// Bad IPs (no-response attempts)
+	mux.HandleFunc("/api/bad-ips", badIPsAPIHandler)
 	// New UI page for dedicated log search window
 	mux.HandleFunc("/logs", logsPageHandler)
 	// New UI page for live sessions view
 	mux.HandleFunc("/live", liveSessionsPageHandler)
+	// UI page for bad IPs
+	mux.HandleFunc("/bad-ips", badIPsPageHandler)
 	// WebSocket endpoints for live feeds
 	mux.HandleFunc("/ws/logs", wsLogsHandler)
 	mux.HandleFunc("/ws/sessions", wsSessionsHandler)
@@ -2143,7 +2147,7 @@ button{cursor:pointer}
 .card{background:var(--panel);border:1px solid #22283d;border-radius:10px;padding:1rem}
 .mono{font-family:ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace}
 small.muted{color:var(--muted)}
-.table{width:100%;border-collapse:collapse}
+.table{width:99%;border-collapse:collapse}
 .table th,.table td{padding:.4rem .5rem;border-bottom:1px solid #22283d;white-space:nowrap}
 .table th{color:#b8c1d6;text-align:left;font-weight:600}
 .kpis{display:flex;gap:1rem;flex-wrap:wrap;margin:.5rem 0 0}
@@ -2154,7 +2158,7 @@ small.muted{color:var(--muted)}
 details summary{cursor:pointer;color:#9aa6c8}
 .badge{font-size:.75rem;background:#0f1529;border:1px solid #22283d;border-radius:999px;padding:.15rem .5rem}
 footer{padding:1rem 1.5rem;border-top:1px solid #22283d;color:#9aa6c8}
-#chart{height:36vh !important;height:36svh !important;height:36dvh !important;max-height:36vh !important;max-height:36svh !important;max-height:36dvh !important;width:100%}
+#chart{height:36vh !important;height:36svh !important;height:36dvh !important;max-height:36vh !important;max-height:36svh !important;max-height:36dvh !important;width:95%}
 .tops-grid{display:grid;grid-template-columns:1fr 1fr;gap:.75rem;margin-top:.5rem}
 @media(max-width:1000px){.tops-grid{grid-template-columns:1fr}}
 .tops-grid canvas{height:240px !important;max-height:240px !important;width:100%}
@@ -2765,6 +2769,12 @@ func scanIPLogs(root string, ip string, since, until time.Time, side string, fil
 	if v4 == nil || v4.To4() == nil {
 		return nil, false, fmt.Errorf("invalid ip")
 	}
+	// If the queried IP is not within our configured logging prefixes, it will not have its own per-IP folders.
+	// In that case, fall back to scanning all stored logs within the requested time window and match by IP on either side.
+	if !ipInLoggingPrefixes(ip) {
+		return scanAllLogsForIP(root, ip, since, until, side, filters, offset, limit)
+	}
+	v4 = v4.To4()
 	oct := v4.To4()
 	o1, o2, o3, o4 := int(oct[0]), int(oct[1]), int(oct[2]), int(oct[3])
 	since = since.UTC()
@@ -2899,6 +2909,174 @@ func scanIPLogs(root string, ip string, since, until time.Time, side string, fil
 				}
 			}
 			_ = f.Close()
+		}
+	}
+	return out, hasMore, nil
+}
+
+// scanAllLogsForIP performs a time-bounded recursive scan across stored hourly folders
+// and returns entries where the queried IP matches the selected side(s). It respects
+// protocol/address/port filters and supports pagination via offset/limit.
+func scanAllLogsForIP(root string, ip string, since, until time.Time, side string, filters fsLogFilters, offset, limit int) ([]fsLogItem, bool, error) {
+	ip = strings.TrimSpace(ip)
+	v4 := net.ParseIP(ip)
+	if v4 == nil || v4.To4() == nil {
+		return nil, false, fmt.Errorf("invalid ip")
+	}
+	since = since.UTC()
+	until = until.UTC()
+	if until.Before(since) {
+		since, until = until, since
+	}
+	startHour := since.Truncate(time.Hour)
+	endHour := until.Truncate(time.Hour)
+	protoFilter := normalizeProto(filters.Proto)
+	side = strings.ToLower(strings.TrimSpace(side))
+	matchIdx := 0
+	var out []fsLogItem
+	hasMore := false
+	stopErr := errors.New("scan-stop")
+	for h := startHour; !h.After(endHour); h = h.Add(time.Hour) {
+		y := strconv.Itoa(h.Year())
+		m := twoDigit(int(h.Month()))
+		d := twoDigit(h.Day())
+		hh := twoDigit(h.Hour())
+		hourDir := filepath.Join(root, y, m, d, hh)
+		// Walk all existing IP folders for this hour
+		_ = filepath.Walk(hourDir, func(path string, info os.FileInfo, err error) error {
+			if err != nil {
+				return nil
+			}
+			if info == nil || info.IsDir() {
+				return nil
+			}
+			base := filepath.Base(path)
+			if base != "src-port.log" && base != "dst-port.log" {
+				return nil
+			}
+			f, err := os.Open(path)
+			if err != nil {
+				return nil
+			}
+			defer f.Close()
+			sc := bufio.NewScanner(f)
+			for sc.Scan() {
+				line := strings.TrimSpace(sc.Text())
+				if line == "" {
+					continue
+				}
+				// separate router
+				router := ""
+				prefix := line
+				if idx := strings.LastIndex(line, " router="); idx >= 0 {
+					prefix = strings.TrimSpace(line[:idx])
+					router = strings.TrimSpace(strings.TrimPrefix(line[idx+1:], "router="))
+				}
+				fields := strings.Fields(prefix)
+				if len(fields) < 7 {
+					continue
+				}
+				startStr := fields[0]
+				endStr := fields[1]
+				bytesStr := fields[2]
+				packetsStr := fields[3]
+				proto := strings.ToUpper(fields[4])
+				srcPair := fields[5]
+				dstPair := fields[len(fields)-1]
+				if strings.Contains(dstPair, ">") && len(fields) >= 8 {
+					dstPair = fields[7]
+				}
+				srcIP, srcPort := "", 0
+				dstIP, dstPort := "", 0
+				if p := strings.Split(srcPair, ":"); len(p) == 2 {
+					srcIP = p[0]
+					srcPort, _ = strconv.Atoi(p[1])
+				}
+				if p := strings.Split(dstPair, ":"); len(p) == 2 {
+					dstIP = p[0]
+					dstPort, _ = strconv.Atoi(p[1])
+				}
+				b, _ := strconv.ParseInt(bytesStr, 10, 64)
+				pk, _ := strconv.ParseInt(packetsStr, 10, 64)
+				sh, sm, ss, ok1 := parseHHMMSS(startStr)
+				eh, em, es, ok2 := parseHHMMSS(endStr)
+				if !ok1 || !ok2 {
+					continue
+				}
+				stAbs := time.Date(h.Year(), h.Month(), h.Day(), sh, sm, ss, 0, time.UTC)
+				etAbs := time.Date(h.Year(), h.Month(), h.Day(), eh, em, es, 0, time.UTC)
+				if stAbs.Before(since) || stAbs.After(until) {
+					continue
+				}
+				if protoFilter != "" && !strings.EqualFold(proto, protoFilter) {
+					continue
+				}
+				if filters.Src != "" && !strings.Contains(srcIP, filters.Src) {
+					continue
+				}
+				if filters.Dst != "" && !strings.Contains(dstIP, filters.Dst) {
+					continue
+				}
+				if filters.Port > 0 && !(srcPort == filters.Port || dstPort == filters.Port) {
+					continue
+				}
+				if filters.SrcPort > 0 && srcPort != filters.SrcPort {
+					continue
+				}
+				if filters.DstPort > 0 && dstPort != filters.DstPort {
+					continue
+				}
+				// Side/IP match logic: determine whether the requested IP matches this line per requested side
+				matchSide := ""
+				switch side {
+				case "src":
+					if srcIP == ip {
+						matchSide = "src"
+					} else {
+						continue
+					}
+				case "dst":
+					if dstIP == ip {
+						matchSide = "dst"
+					} else {
+						continue
+					}
+				default:
+					if srcIP == ip {
+						matchSide = "src"
+					} else if dstIP == ip {
+						matchSide = "dst"
+					} else {
+						continue
+					}
+				}
+				matchIdx++
+				if matchIdx <= offset {
+					continue
+				}
+				if len(out) < limit {
+					out = append(out, fsLogItem{
+						Start:    stAbs.UTC().Format(time.RFC3339),
+						End:      etAbs.UTC().Format(time.RFC3339),
+						Bytes:    b,
+						Packets:  pk,
+						Protocol: proto,
+						SrcIP:    srcIP, SrcPort: srcPort,
+						DstIP: dstIP, DstPort: dstPort,
+						Router: router,
+						Side:   matchSide,
+					})
+				} else {
+					hasMore = true
+					_ = f.Close()
+					return stopErr
+				}
+			}
+			_ = f.Close()
+			return nil
+		})
+		if hasMore || (limit > 0 && len(out) >= limit) {
+			break
 		}
 	}
 	return out, hasMore, nil
@@ -3042,7 +3220,7 @@ func logsPageHandler(w http.ResponseWriter, r *http.Request) {
 <style>
  body{font-family:system-ui,Segoe UI,Roboto,Arial,sans-serif;margin:0;background:#0b1020;color:#e6edf3}
  header, .controls{padding:1rem 1.25rem;border-bottom:1px solid #22283d;display:flex;gap:.5rem;align-items:center;flex-wrap:wrap}
- table{width:100%;border-collapse:collapse;background:#141a2f;border:1px solid #22283d;border-radius:10px;margin:1rem;overflow:hidden}
+ table{width:99%;border-collapse:collapse;background:#141a2f;border:1px solid #22283d;border-radius:10px;margin:1rem;overflow:hidden}
  th,td{padding:.4rem .5rem;border-bottom:1px solid #22283d;text-align:right}
  th:first-child, td:first-child{text-align:left}
  small.m{color:#8b96b1}
@@ -3327,18 +3505,27 @@ func wsSessionsHandler(w http.ResponseWriter, r *http.Request) {
 	}(c)
 }
 
+// getenv returns a configuration value with precedence: Environment > INI file > default.
 func getenv(k, def string) string {
 	if v := os.Getenv(k); v != "" {
+		return v
+	}
+	if v, ok := getINI(k); ok && strings.TrimSpace(v) != "" {
 		return v
 	}
 	return def
 }
 
-// getenvBool reads an environment variable as a boolean with a default.
+// getenvBool reads a configuration value as a boolean with a default.
 // Truthy values: 1, true, yes, y, on (case-insensitive).
 // Falsy values: 0, false, no, n, off (case-insensitive).
 func getenvBool(k string, def bool) bool {
 	v := strings.TrimSpace(strings.ToLower(os.Getenv(k)))
+	if v == "" {
+		if iniV, ok := getINI(k); ok {
+			v = strings.TrimSpace(strings.ToLower(iniV))
+		}
+	}
 	if v == "" {
 		return def
 	}
@@ -3352,9 +3539,14 @@ func getenvBool(k string, def bool) bool {
 	}
 }
 
-// getenvInt reads an environment variable as int with default value.
+// getenvInt reads a configuration value as int with default value.
 func getenvInt(k string, def int) int {
 	v := strings.TrimSpace(os.Getenv(k))
+	if v == "" {
+		if iniV, ok := getINI(k); ok {
+			v = strings.TrimSpace(iniV)
+		}
+	}
 	if v == "" {
 		return def
 	}
@@ -5367,7 +5559,7 @@ func ipTableIndexHandler(w http.ResponseWriter, r *http.Request) {
  header{padding:1rem 1.25rem;border-bottom:1px solid #22283d;display:flex;gap:.75rem;align-items:center;flex-wrap:wrap}
  header h1{font-size:1rem;margin:0;color:#cbd4e6}
  .container{padding:1rem 1.25rem}
- table{width:100%;border-collapse:collapse;background:#141a2f;border:1px solid #22283d;border-radius:10px;overflow:hidden}
+ table{width:99%;border-collapse:collapse;background:#141a2f;border:1px solid #22283d;border-radius:10px;overflow:hidden}
  th,td{padding:.5rem .6rem;border-bottom:1px solid #22283d;text-align:right}
  th:first-child, td:first-child{text-align:left}
  tbody tr:hover{background:#10162b}
@@ -5389,6 +5581,7 @@ func ipTableIndexHandler(w http.ResponseWriter, r *http.Request) {
       </select>
     </label>
     <button id="refresh">Refresh</button>
+    <button id="badIpsBtn" title="View IPs that probed without response" onclick="window.location.href='/bad-ips'">Bad IPs</button>
     <small class="m">Only IPs within logging prefix list are shown.</small>
     <small class="m" id="sessInfo" style="margin-left:1rem">Total sessions: <span id="sessionsTotal">-</span></small>
   </div>
@@ -5515,7 +5708,7 @@ async function load(){
     const ipTd=document.createElement('td');
     const a=document.createElement('a'); a.href='#'; a.textContent=it.ip; a.addEventListener('click', function(e){ e.preventDefault(); const url='/logs?src='+encodeURIComponent(it.ip)+'&autoscroll=1'; window.open(url, '_blank'); });
     const peersBtn=document.createElement('button'); peersBtn.textContent='Peers'; peersBtn.style.marginLeft='.4rem'; peersBtn.addEventListener('click', function(e){ e.preventDefault(); setParam('ip', it.ip); loadPeers(it.ip); });
-    const liveBtn=document.createElement('button'); liveBtn.textContent='Live Sessions'; liveBtn.style.marginLeft='.4rem'; liveBtn.addEventListener('click', function(e){ e.preventDefault(); const url='/live?src='+encodeURIComponent(it.ip); window.open(url, '_blank'); });
+    const liveBtn=document.createElement('button'); liveBtn.textContent='Live Sessions'; liveBtn.style.marginLeft='.4rem'; liveBtn.addEventListener('click', function(e){ e.preventDefault(); const url='/live?ip='+encodeURIComponent(it.ip); window.open(url, '_blank'); });
     ipTd.appendChild(a);
     ipTd.appendChild(peersBtn);
     ipTd.appendChild(liveBtn);
@@ -5764,7 +5957,7 @@ func liveSessionsPageHandler(w http.ResponseWriter, r *http.Request) {
 <style>
  body{font-family:system-ui,Segoe UI,Roboto,Arial,sans-serif;margin:0;background:#0b1020;color:#e6edf3}
  header, .controls{padding:1rem 1.25rem;border-bottom:1px solid #22283d;display:flex;gap:.5rem;align-items:center;flex-wrap:wrap}
- table{width:100%;border-collapse:collapse;background:#141a2f;border:1px solid #22283d;border-radius:10px;margin:1rem;overflow:hidden}
+ table{width:99%;border-collapse:collapse;background:#141a2f;border:1px solid #22283d;border-radius:10px;margin:1rem;overflow:hidden}
  th,td{padding:.4rem .5rem;border-bottom:1px solid #22283d;text-align:right}
  th:first-child, td:first-child{text-align:left}
  small.m{color:#8b96b1}
@@ -5848,4 +6041,437 @@ func liveSessionsPageHandler(w http.ResponseWriter, r *http.Request) {
 </script>
 </body>
 </html>`))
+}
+
+// badIPsAPIHandler returns a list of source IPs that attempted to access destinations within
+// the logging prefixes but did not receive any response back, ordered by the number of unique
+// destination IPs they probed without response. Time window defaults to last 1 hour and is
+// adjustable via since/until query params (RFC3339 or relative like -1h).
+func badIPsAPIHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	q := r.URL.Query()
+	var since, until time.Time
+	if v := strings.TrimSpace(q.Get("since")); v != "" {
+		if t, ok := parseTime(v); ok {
+			since = t
+		}
+	}
+	if v := strings.TrimSpace(q.Get("until")); v != "" {
+		if t, ok := parseTime(v); ok {
+			until = t
+		}
+	}
+	if until.IsZero() {
+		until = time.Now()
+	}
+	if since.IsZero() {
+		since = until.Add(-1 * time.Hour)
+	}
+	if until.Before(since) {
+		since, until = until, since
+	}
+	limit := 100
+	if v := q.Get("limit"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			limit = n
+		}
+	}
+
+	// Build a set of pair keys for existence checks and iterate pairs in the time window.
+	pairs := store.pairMinute.Items() // key format: SRC|DST|unix5m
+	keyExists := make(map[string]struct{}, len(pairs))
+	for k := range pairs {
+		keyExists[k] = struct{}{}
+	}
+
+	// For each SRC->DST record in window, if no reverse DST->SRC traffic exists in same/adjacent bucket,
+	// consider it an unanswered attempt. We will compute both:
+	//  - distinct destination IP count per source
+	//  - total unanswered attempts per source (sum of sessions for the pair-minute)
+	tStart := since.UTC().Truncate(5 * time.Minute)
+	tEnd := until.UTC()
+	perSrcDistinct := make(map[string]map[string]struct{}) // src -> set(dst)
+	perSrcAttempts := make(map[string]int)
+	lastSeen := make(map[string]time.Time)
+	// Respect UI/TSDB CIDR filter: only count attempts targeting destinations within the active CIDRs ("current view").
+	allowedCache := make(map[string]bool)
+	isAllowed := func(ip string) bool {
+		if v, ok := allowedCache[ip]; ok {
+			return v
+		}
+		v := ipInLoggingPrefixes(ip)
+		allowedCache[ip] = v
+		return v
+	}
+	for k := range pairs {
+		// parse key
+		last := strings.LastIndex(k, "|")
+		if last <= 0 || last+1 >= len(k) {
+			continue
+		}
+		muStr := k[last+1:]
+		rest := k[:last]
+		first := strings.Index(rest, "|")
+		if first <= 0 {
+			continue
+		}
+		src := rest[:first]
+		dst := rest[first+1:]
+		// Only consider destinations within the active CIDR filter to match the current view
+		if !isAllowed(dst) {
+			continue
+		}
+		mu, err := strconv.ParseInt(muStr, 10, 64)
+		if err != nil {
+			continue
+		}
+		mt := time.Unix(mu, 0).UTC()
+		if mt.Before(tStart) || mt.After(tEnd) {
+			continue
+		}
+		// reverse existence in same or adjacent bucket (+/- 5m)
+		m0 := mu
+		m1 := mu - int64(5*60)
+		m2 := mu + int64(5*60)
+		rev0 := fmt.Sprintf("%s|%s|%d", dst, src, m0)
+		rev1 := fmt.Sprintf("%s|%s|%d", dst, src, m1)
+		rev2 := fmt.Sprintf("%s|%s|%d", dst, src, m2)
+		if _, ok := keyExists[rev0]; ok {
+			continue
+		}
+		if _, ok := keyExists[rev1]; ok {
+			continue
+		}
+		if _, ok := keyExists[rev2]; ok {
+			continue
+		}
+		// unanswered
+		set := perSrcDistinct[src]
+		if set == nil {
+			set = make(map[string]struct{})
+			perSrcDistinct[src] = set
+		}
+		set[dst] = struct{}{}
+		// attempts: use session count if available; fallback 1
+		if n, ok := store.pairMinuteSess.Get(k); ok {
+			perSrcAttempts[src] += int(n)
+		} else {
+			perSrcAttempts[src] += 1
+		}
+		if lastSeen[src].Before(mt) {
+			lastSeen[src] = mt
+		}
+	}
+
+	type row struct {
+		IP       string `json:"ip"`
+		Country  string `json:"country"`
+		Count    int    `json:"count"`    // distinct destinations (backward compatibility)
+		Attempts int    `json:"attempts"` // total unanswered attempts
+		LastSeen string `json:"last_seen"`
+	}
+	var rows []row
+	for src, set := range perSrcDistinct {
+		rows = append(rows, row{
+			IP:       src,
+			Country:  countryForIP(src),
+			Count:    len(set),
+			Attempts: perSrcAttempts[src],
+			LastSeen: lastSeen[src].UTC().Format(time.RFC3339),
+		})
+	}
+	sort.Slice(rows, func(i, j int) bool {
+		// Order by total unanswered attempts (desc), then distinct dest count (desc),
+		// then last_seen (desc), then IP (asc) for stability.
+		if rows[i].Attempts == rows[j].Attempts {
+			if rows[i].Count == rows[j].Count {
+				if rows[i].LastSeen == rows[j].LastSeen {
+					return rows[i].IP < rows[j].IP
+				}
+				return rows[i].LastSeen > rows[j].LastSeen
+			}
+			return rows[i].Count > rows[j].Count
+		}
+		return rows[i].Attempts > rows[j].Attempts
+	})
+	if limit > 0 && len(rows) > limit {
+		rows = rows[:limit]
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]any{
+		"generated_at": time.Now().UTC().Format(time.RFC3339),
+		"since":        tStart.Format(time.RFC3339),
+		"until":        tEnd.UTC().Format(time.RFC3339),
+		"items":        rows,
+	})
+}
+
+// badIPsPageHandler serves a simple table UI for the bad IPs list.
+func badIPsPageHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	_, _ = w.Write([]byte(`<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1"/>
+<title>FlowAnalyzer - Unanswered Access Attempts</title>
+<style>
+ body{font-family:system-ui,Segoe UI,Roboto,Arial,sans-serif;margin:0;background:#0b1020;color:#e6edf3}
+ header{padding:1rem 1.25rem;border-bottom:1px solid #22283d;display:flex;gap:.75rem;align-items:center;flex-wrap:wrap}
+ header h1{font-size:1rem;margin:0;color:#cbd4e6}
+ .container{padding:1rem 1.25rem}
+ table{width:99%;border-collapse:collapse;background:#141a2f;border:1px solid #22283d;border-radius:10px;overflow:hidden}
+ th,td{padding:.5rem .6rem;border-bottom:1px solid #22283d;text-align:right}
+ th:first-child, td:first-child{text-align:left}
+ tbody tr:hover{background:#10162b}
+ small.m{color:#8b96b1}
+ select,button{background:#0f1529;color:#e6edf3;border:1px solid #253055;border-radius:6px;padding:.35rem .5rem}
+ .muted{color:#8b96b1}
+</style>
+</head>
+<body>
+<header>
+  <h1>Unanswered Access Attempts</h1>
+  <div class="controls">
+    <label>Window
+      <select id="win">
+        <option value="1h" selected>Last 1h</option>
+        <option value="8h">Last 8h</option>
+        <option value="24h">Last 24h</option>
+      </select>
+    </label>
+    <button id="refresh">Refresh</button>
+    <small class="m">Shows distinct destination IPs scanned and total unanswered attempts (no reverse traffic) within the selected window.</small>
+  </div>
+</header>
+<div class="container">
+  <table id="tbl">
+    <thead>
+      <tr>
+        <th>Source IP</th>
+        <th>Country</th>
+        <th>Unanswered Dests</th>
+        <th>Total Attempts</th>
+        <th>Last Seen</th>
+        <th>Actions</th>
+      </tr>
+    </thead>
+    <tbody></tbody>
+  </table>
+</div>
+<script>
+function buildURL(){
+  const w=document.getElementById('win').value;
+  let since='';
+  const now=new Date();
+  if(w==='1h'){ since=new Date(now.getTime()-3600*1000); }
+  else if(w==='8h'){ since=new Date(now.getTime()-8*3600*1000); }
+  else { since=new Date(now.getTime()-24*3600*1000); }
+  function pad(n){return String(n).padStart(2,'0');}
+  function toLocal(d){return d.getFullYear()+'-'+pad(d.getMonth()+1)+'-'+pad(d.getDate())+'T'+pad(d.getHours())+':'+pad(d.getMinutes())+':'+pad(d.getSeconds());}
+  const p=new URLSearchParams();
+  p.set('since', toLocal(since));
+  p.set('until', toLocal(now));
+  p.set('limit','200');
+  return '/api/bad-ips?'+p.toString();
+}
+function render(items){
+  const tbody=document.querySelector('#tbl tbody');
+  tbody.innerHTML='';
+  (items||[]).forEach(function(it){
+    const tr=document.createElement('tr');
+    function td(t){ const d=document.createElement('td'); d.textContent=t; return d; }
+    const src=document.createElement('td');
+    const a=document.createElement('a'); a.href='/logs?src='+encodeURIComponent(it.ip)+'&autoscroll=1'; a.textContent=it.ip; a.target='_blank'; src.appendChild(a);
+    tr.appendChild(src);
+    tr.appendChild(td(it.country||''));
+    tr.appendChild(td(String(it.count||0)));
+    tr.appendChild(td(String(it.attempts||0)));
+    tr.appendChild(td(it.last_seen||''));
+    const ac=document.createElement('td');
+    const l1=document.createElement('a'); l1.href='/logs?src='+encodeURIComponent(it.ip); l1.textContent='Logs'; l1.target='_blank';
+    ac.appendChild(l1);
+    tr.appendChild(ac);
+    tbody.appendChild(tr);
+  });
+}
+async function load(){
+  const r=await fetch(buildURL());
+  if(!r.ok){ console.error('api', r.status); return; }
+  const data=await r.json();
+  render(data.items||[]);
+}
+window.addEventListener('DOMContentLoaded', function(){
+  document.getElementById('refresh').addEventListener('click', load);
+  document.getElementById('win').addEventListener('change', load);
+  load();
+});
+</script>
+</body>
+</html>`))
+}
+
+// --- INI configuration loading -------------------------------------------------
+// All configuration parameters can be specified in an INI-style file placed
+// alongside the executable. We look for "FlowAnalyzer.ini" first, then
+// fallback to "config.ini". Keys are case-insensitive and are matched against
+// the same names used for environment variables (e.g., ADDR, PORT, TSDB_ROOT).
+
+var iniConfig map[string]string
+
+// getINI returns a value from the loaded INI by key (case-insensitive).
+func getINI(k string) (string, bool) {
+	if iniConfig == nil {
+		return "", false
+	}
+	v, ok := iniConfig[strings.ToUpper(strings.TrimSpace(k))]
+	return v, ok
+}
+
+// loadINIConfig parses the INI file located next to the executable.
+func loadINIConfig() {
+	// Determine executable directory.
+	exe, err := os.Executable()
+	dir := "."
+	if err == nil && strings.TrimSpace(exe) != "" {
+		dir = filepath.Dir(exe)
+	}
+	candidates := []string{
+		filepath.Join(dir, "FlowAnalyzer.ini"),
+		filepath.Join(dir, "config.ini"),
+	}
+	var path string
+	for _, p := range candidates {
+		if st, err := os.Stat(p); err == nil && !st.IsDir() {
+			path = p
+			break
+		}
+	}
+	if path == "" {
+		// No INI present -> generate one with current effective settings beside the executable.
+		// Do not overwrite if the file suddenly appears between checks.
+		outPath := filepath.Join(dir, "FlowAnalyzer.ini")
+
+		// Build current effective configuration using environment variables or defaults.
+		bool01 := func(b bool) string {
+			if b {
+				return "1"
+			}
+			return "0"
+		}
+		cfg := map[string]string{
+			"ADDR":                    getenv("ADDR", "0.0.0.0"),
+			"PORT":                    getenv("PORT", "8080"),
+			"RETENTION_MINUTES":       strconv.Itoa(getenvInt("RETENTION_MINUTES", retentionMinutes)),
+			"FLOW_TIMEOUT_MINUTES":    strconv.Itoa(getenvInt("FLOW_TIMEOUT_MINUTES", flowTimeoutMinutes)),
+			"COMPACT_EVERY_SECONDS":   strconv.Itoa(getenvInt("COMPACT_EVERY_SECONDS", compactEverySeconds)),
+			"MAX_SESSIONS_TRIGGER":    strconv.Itoa(getenvInt("MAX_SESSIONS_TRIGGER", maxSessionsBeforeCompactTrigger)),
+			"METRICS_RETENTION_HOURS": strconv.Itoa(getenvInt("METRICS_RETENTION_HOURS", summariesRetentionHours)),
+			"COLLECTOR_WORKERS":       strconv.Itoa(getenvInt("COLLECTOR_WORKERS", collectorWorkers)),
+			"COLLECTOR_QUEUE":         strconv.Itoa(getenvInt("COLLECTOR_QUEUE", collectorQueue)),
+			"WS_MAX_CONNS":            strconv.Itoa(getenvInt("WS_MAX_CONNS", wsMaxConns)),
+			"PPROF_ENABLE":            bool01(getenvBool("PPROF_ENABLE", false)),
+			"LOG_REQUESTS":            bool01(getenvBool("LOG_REQUESTS", false)),
+			"SERVICE_DISABLE":         bool01(getenvBool("SERVICE_DISABLE", false)),
+			"DEDUP_ENABLE":            bool01(getenvBool("DEDUP_ENABLE", true)),
+			"DEDUP_TTL_MIN":           strconv.Itoa(getenvInt("DEDUP_TTL_MIN", 1)),
+			"TSDB_ENABLE":             bool01(getenvBool("TSDB_ENABLE", true)),
+			"TSDB_ROOT":               getenv("TSDB_ROOT", "E:\\DB"),
+			"TSDB_SHARDS":             strconv.Itoa(getenvInt("TSDB_SHARDS", runtime.GOMAXPROCS(0))),
+			"TSDB_QUEUE_SIZE":         strconv.Itoa(getenvInt("TSDB_QUEUE_SIZE", 65536)),
+			"TSDB_FLUSH_MS":           strconv.Itoa(getenvInt("TSDB_FLUSH_MS", 1000)),
+			"TSDB_IDLE_CLOSE_SEC":     strconv.Itoa(getenvInt("TSDB_IDLE_CLOSE_SEC", 60)),
+			"TSDB_LOG_DROPS":          bool01(getenvBool("TSDB_LOG_DROPS", false)),
+			"TSDB_LOG_ERRORS":         bool01(getenvBool("TSDB_LOG_ERRORS", true)),
+			"TSDB_FILTER_CIDRS":       getenv("TSDB_FILTER_CIDRS", ""),
+			"NETFLOW_ADDR":            getenv("NETFLOW_ADDR", "0.0.0.0:2055"),
+			"IPFIX_ADDR":              getenv("IPFIX_ADDR", "0.0.0.0:4739"),
+		}
+
+		// Stable order for readability
+		order := []string{
+			"ADDR", "PORT",
+			"PPROF_ENABLE", "LOG_REQUESTS", "SERVICE_DISABLE",
+			"RETENTION_MINUTES", "FLOW_TIMEOUT_MINUTES", "COMPACT_EVERY_SECONDS", "MAX_SESSIONS_TRIGGER",
+			"METRICS_RETENTION_HOURS",
+			"COLLECTOR_WORKERS", "COLLECTOR_QUEUE",
+			"WS_MAX_CONNS",
+			"DEDUP_ENABLE", "DEDUP_TTL_MIN",
+			"TSDB_ENABLE", "TSDB_ROOT", "TSDB_SHARDS", "TSDB_QUEUE_SIZE", "TSDB_FLUSH_MS", "TSDB_IDLE_CLOSE_SEC", "TSDB_LOG_DROPS", "TSDB_LOG_ERRORS", "TSDB_FILTER_CIDRS",
+			"NETFLOW_ADDR", "IPFIX_ADDR",
+		}
+
+		var b strings.Builder
+		b.WriteString("; FlowAnalyzer.ini\n")
+		b.WriteString("; Auto-generated on ")
+		b.WriteString(time.Now().Format(time.RFC3339))
+		b.WriteString("\n; Place this file next to FlowAnalyzer.exe.\n")
+		b.WriteString("; Environment variables, if set, override these values.\n")
+		b.WriteString("; Boolean values use 1/0 (true/false).\n\n")
+		for _, k := range order {
+			if v, ok := cfg[k]; ok {
+				b.WriteString(k)
+				b.WriteString("=")
+				b.WriteString(v)
+				b.WriteString("\n")
+			}
+		}
+
+		// Try to create the file (do not overwrite)
+		if f, err := os.OpenFile(outPath, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o644); err == nil {
+			_, _ = f.WriteString(b.String())
+			_ = f.Close()
+			// Reflect in-memory INI for this process too
+			iniConfig = cfg
+		}
+		return
+	}
+	f, err := os.Open(path)
+	if err != nil {
+		return
+	}
+	defer f.Close()
+
+	s := bufio.NewScanner(f)
+	cfg := make(map[string]string)
+	for s.Scan() {
+		line := strings.TrimSpace(s.Text())
+		if line == "" || strings.HasPrefix(line, "#") || strings.HasPrefix(line, ";") {
+			continue
+		}
+		// skip section headers like [section]
+		if strings.HasPrefix(line, "[") && strings.Contains(line, "]") {
+			continue
+		}
+		// support both key=value and key: value
+		sepIdx := strings.IndexAny(line, "=:")
+		if sepIdx < 0 {
+			continue
+		}
+		key := strings.TrimSpace(line[:sepIdx])
+		val := strings.TrimSpace(line[sepIdx+1:])
+		// remove optional surrounding quotes
+		if len(val) >= 2 && ((strings.HasPrefix(val, "\"") && strings.HasSuffix(val, "\"")) || (strings.HasPrefix(val, "'") && strings.HasSuffix(val, "'"))) {
+			val = val[1 : len(val)-1]
+		}
+		if key != "" {
+			cfg[strings.ToUpper(key)] = val
+		}
+	}
+	if err := s.Err(); err != nil {
+		// ignore parse errors silently to avoid disrupting startup
+	}
+	iniConfig = cfg
+}
+
+func init() {
+	loadINIConfig()
 }

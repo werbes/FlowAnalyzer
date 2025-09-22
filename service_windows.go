@@ -53,10 +53,14 @@ func (f *flowSvc) Execute(args []string, r <-chan svc.ChangeRequest, s chan<- sv
 	mux.HandleFunc("/api/ips", ipsHandler)
 	mux.HandleFunc("/api/ip", ipViewHandler)
 	mux.HandleFunc("/api/ip_table", ipTableHandler)
+	// Bad IPs (no-response attempts)
+	mux.HandleFunc("/api/bad-ips", badIPsAPIHandler)
 	// New UI page for dedicated log search window
 	mux.HandleFunc("/logs", logsPageHandler)
 	// Live sessions page and WebSocket endpoints
 	mux.HandleFunc("/live", liveSessionsPageHandler)
+	// UI page for bad IPs
+	mux.HandleFunc("/bad-ips", badIPsPageHandler)
 	// WebSocket endpoint for live log feed
 	mux.HandleFunc("/ws/logs", wsLogsHandler)
 	mux.HandleFunc("/ws/sessions", wsSessionsHandler)
