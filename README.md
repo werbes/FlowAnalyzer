@@ -311,7 +311,7 @@ GOOS=darwin GOARCH=arm64 go build -o flowanalyzer .
 
 ### License
 
-Specify your chosen license here (e.g., MIT). Add a `LICENSE` file in the repository.
+I have not decided what hippie license this project should be under. I'm open for suggestions. 
 
 ---
 
