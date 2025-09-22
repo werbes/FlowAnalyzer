@@ -35,8 +35,8 @@ func TestTopIPsAndProtocolEndpointsHaveData(t *testing.T) {
 		t.Fatalf("top_ips status=%d body=%s", rec.Code, rec.Body.String())
 	}
 	var topResp struct {
-		Series []struct{
-			IP string `json:"ip"`
+		Series []struct {
+			IP     string           `json:"ip"`
 			Points []map[string]any `json:"points"`
 		} `json:"series"`
 	}
@@ -76,4 +76,81 @@ func TestTopIPsAndProtocolEndpointsHaveData(t *testing.T) {
 // helper to stringify time as unix seconds for the parseTime function to accept
 func strconvI(t time.Time) string {
 	return strconv.FormatInt(t.Unix(), 10)
+}
+
+func TestStatusZipDisabledAndRecentSenders(t *testing.T) {
+	resetStore()
+	// Clean globals used by status
+	for k := range recentRouters.Items() {
+		recentRouters.Remove(k)
+	}
+	for k := range routerMinuteFlows.Items() {
+		routerMinuteFlows.Remove(k)
+	}
+
+	// Simulate a router recently sending flows
+	ip := "1.2.3.4"
+	recentRouters.Set(ip, time.Now().Unix())
+	// Add a tracked session attributed to that router to increment per-minute flow counter
+	now := time.Now()
+	store.AddMany([]FlowSession{{
+		Timestamp: now,
+		Router:    ip,
+		SrcIP:     "10.0.0.1",
+		DstIP:     "10.0.0.2",
+		Protocol:  "UDP",
+		Bytes:     10,
+		Packets:   1,
+	}})
+
+	req := httptest.NewRequest("GET", "/api/status", nil)
+	rec := httptest.NewRecorder()
+	statusAPIHandler(rec, req)
+	if rec.Code != 200 {
+		t.Fatalf("status code=%d body=%s", rec.Code, rec.Body.String())
+	}
+	var payload map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("json: %v", err)
+	}
+	// Verify ZIP is enabled by default on status
+	proc, ok := payload["processes"].(map[string]any)
+	if !ok {
+		t.Fatalf("missing processes")
+	}
+	zipInfo, ok := proc["zip"].(map[string]any)
+	if !ok {
+		t.Fatalf("missing processes.zip")
+	}
+	if en, ok := zipInfo["enabled"].(bool); !ok || !en {
+		t.Fatalf("expected zip.enabled=true by default, got %v", zipInfo["enabled"])
+	}
+	// Verify recent_senders_5m_counts contains our router with flows > 0
+	rows, ok := payload["recent_senders_5m_counts"].([]any)
+	if !ok {
+		t.Fatalf("missing recent_senders_5m_counts")
+	}
+	found := false
+	for _, it := range rows {
+		m, _ := it.(map[string]any)
+		if m["ip"] == ip {
+			found = true
+			// numbers may decode as float64 in generic map
+			var v float64
+			switch x := m["flows_5m"].(type) {
+			case float64:
+				v = x
+			case int64:
+				v = float64(x)
+			case int:
+				v = float64(x)
+			}
+			if v <= 0 {
+				t.Fatalf("expected flows_5m > 0 for %s, got %v", ip, m["flows_5m"])
+			}
+		}
+	}
+	if !found {
+		t.Fatalf("expected router %s in recent_senders_5m_counts, got %v", ip, rec.Body.String())
+	}
 }

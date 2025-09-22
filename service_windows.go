@@ -64,6 +64,10 @@ func (f *flowSvc) Execute(args []string, r <-chan svc.ChangeRequest, s chan<- sv
 	// WebSocket endpoint for live log feed
 	mux.HandleFunc("/ws/logs", wsLogsHandler)
 	mux.HandleFunc("/ws/sessions", wsSessionsHandler)
+	// Status endpoints
+	mux.HandleFunc("/api/status", statusAPIHandler)
+	mux.HandleFunc("/api/zip/run_now", zipRunNowHandler)
+	mux.HandleFunc("/status", statusPageHandler)
 	mux.HandleFunc("/", ipTableIndexHandler)
 
 	var handler http.Handler = mux
@@ -115,6 +119,8 @@ func (f *flowSvc) Execute(args []string, r <-chan svc.ChangeRequest, s chan<- sv
 			log.Printf("[svc] TSDB filter: %d CIDRs active", len(tsdb.filterCIDRs))
 		}
 		tsdb.Start(bgCtx)
+		// Start background compressor to zip old log files (>2h) similar to console mode
+		startZipCompressor(bgCtx, root)
 		log.Printf("[svc] TSDB enabled: root=%s shards=%d queue=%d", root, shards, qsize)
 	}
 

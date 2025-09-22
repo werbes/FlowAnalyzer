@@ -15,8 +15,8 @@ import (
 func TestLogsSearchHandler_Basic(t *testing.T) {
 	// Setup temp TSDB root with one hour folder and one IP logs
 	root := t.TempDir()
-	// ensure currentTSDBRoot() will pick this root
-	os.Setenv("TSDB_ROOT", root)
+	// ensure currentTSDBRoot() will pick this root via INI-only config
+	iniConfig = map[string]string{"TSDB_ROOT": root}
 	now := time.Now().UTC().Truncate(time.Hour)
 	y, m, d := now.Year(), int(now.Month()), now.Day()
 	hh := now.Hour()
@@ -48,10 +48,10 @@ func TestLogsSearchHandler_Basic(t *testing.T) {
 		t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
 	}
 	var resp struct {
-		IP       string       `json:"ip"`
-		Items    []fsLogItem  `json:"items"`
-		HasMore  bool         `json:"has_more"`
-		NextPage int          `json:"next_page"`
+		IP       string      `json:"ip"`
+		Items    []fsLogItem `json:"items"`
+		HasMore  bool        `json:"has_more"`
+		NextPage int         `json:"next_page"`
 	}
 	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
 		t.Fatalf("unmarshal: %v", err)
@@ -74,7 +74,9 @@ func TestLogsSearchHandler_Basic(t *testing.T) {
 	if rec2.Code != 200 {
 		t.Fatalf("udp status=%d body=%s", rec2.Code, rec2.Body.String())
 	}
-	var resp2 struct{ Items []fsLogItem `json:"items"` }
+	var resp2 struct {
+		Items []fsLogItem `json:"items"`
+	}
 	if err := json.Unmarshal(rec2.Body.Bytes(), &resp2); err != nil {
 		t.Fatalf("udp unmarshal: %v", err)
 	}
@@ -90,7 +92,9 @@ func TestLogsSearchHandler_Basic(t *testing.T) {
 	if rec3.Code != 200 {
 		t.Fatalf("port status=%d body=%s", rec3.Code, rec3.Body.String())
 	}
-	var resp3 struct{ Items []fsLogItem `json:"items"` }
+	var resp3 struct {
+		Items []fsLogItem `json:"items"`
+	}
 	if err := json.Unmarshal(rec3.Body.Bytes(), &resp3); err != nil {
 		t.Fatalf("port unmarshal: %v", err)
 	}

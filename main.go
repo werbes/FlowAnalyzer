@@ -550,6 +550,22 @@ func (s *Store) AddMany(items []FlowSession) int {
 			s.pruneSummaries()
 		}()
 	}
+	// Update per-router minute flow counters for recent-senders table
+	if len(tracked) > 0 {
+		curMin := minuteBucketUnix(time.Now())
+		for _, it := range tracked {
+			if strings.TrimSpace(it.Router) == "" {
+				continue
+			}
+			rk := fmt.Sprintf("%s|%d", it.Router, curMin)
+			routerMinuteFlows.Upsert(rk, 1, func(exist bool, cur, newVal int64) int64 {
+				if exist {
+					return cur + 1
+				}
+				return newVal
+			})
+		}
+	}
 	// Update concurrent indices and summaries without holding the store lock
 	if len(tracked) > 0 {
 		s.indexAndSummarize(tracked)
@@ -1380,6 +1396,10 @@ func main() {
 	// WebSocket endpoints for live feeds
 	mux.HandleFunc("/ws/logs", wsLogsHandler)
 	mux.HandleFunc("/ws/sessions", wsSessionsHandler)
+	// Status endpoints
+	mux.HandleFunc("/api/status", statusAPIHandler)
+	mux.HandleFunc("/api/zip/run_now", zipRunNowHandler)
+	mux.HandleFunc("/status", statusPageHandler)
 	mux.HandleFunc("/", ipTableIndexHandler)
 
 	// Optional pprof endpoints
@@ -1444,6 +1464,8 @@ func main() {
 			log.Printf("TSDB filter: %d CIDRs active", len(nets))
 		}
 		tsdb.Start(bgCtx)
+		// Start background compressor to zip old log files (>2h) without affecting writers
+		startZipCompressor(bgCtx, root)
 		log.Printf("TSDB enabled: root=%s shards=%d queue=%d", root, shards, qsize)
 	}
 
@@ -2762,6 +2784,256 @@ func normalizeProto(p string) string {
 	return strings.ToUpper(p)
 }
 
+// openLogReader returns a reader for the specified .log path. If the .log file
+// does not exist, it attempts to open a sibling .zip file containing an entry
+// with the same base name (e.g., src-port.log -> src-port.zip containing src-port.log).
+// The returned ReadCloser must be closed by the caller.
+func openLogReader(path string) (io.ReadCloser, error) {
+	f, err := os.Open(path)
+	if err == nil {
+		return f, nil
+	}
+	// Try zipped variant
+	zipPath := path + ".zip"
+	zr, err2 := zip.OpenReader(zipPath)
+	if err2 != nil {
+		return nil, err
+	}
+	base := filepath.Base(path)
+	var zf *zip.File
+	for _, e := range zr.File {
+		if e.Name == base {
+			zf = e
+			break
+		}
+	}
+	if zf == nil {
+		if len(zr.File) == 1 {
+			zf = zr.File[0]
+		} else {
+			_ = zr.Close()
+			return nil, fmt.Errorf("zip entry %s not found in %s", base, zipPath)
+		}
+	}
+	rc, err3 := zf.Open()
+	if err3 != nil {
+		_ = zr.Close()
+		return nil, err3
+	}
+	// Compose a ReadCloser that closes both the entry and the zip when done
+	return &compositeReadCloser{Reader: rc, closers: []io.Closer{rc, zr}}, nil
+}
+
+type compositeReadCloser struct {
+	io.Reader
+	closers []io.Closer
+}
+
+func (c *compositeReadCloser) Close() error {
+	var first error
+	for i := len(c.closers) - 1; i >= 0; i-- { // close in reverse order
+		if err := c.closers[i].Close(); err != nil && first == nil {
+			first = err
+		}
+	}
+	return first
+}
+
+// startZipCompressor launches a background routine that periodically compresses
+// TSDB .log files older than the configured threshold into .zip archives.
+func startZipCompressor(ctx context.Context, root string) {
+	zipEnabled = getenvBool("TSDB_ZIP_ENABLE", true)
+	if !zipEnabled {
+		return
+	}
+	olderHours := getenvInt("TSDB_ZIP_OLDER_THAN_HOURS", 2)
+	if olderHours < 1 {
+		olderHours = 1
+	}
+	everyMin := getenvInt("TSDB_ZIP_EVERY_MINUTES", 5)
+	if everyMin < 1 {
+		everyMin = 5
+	}
+	interval := time.Duration(everyMin) * time.Minute
+	zipInterval = interval
+	if zipTrigger == nil {
+		zipTrigger = make(chan struct{}, 1)
+	}
+	threshold := func() time.Time {
+		return time.Now().UTC().Add(-time.Duration(olderHours) * time.Hour).Truncate(time.Hour)
+	}
+
+	compressOnce := func() {
+		atomic.StoreInt32(&zipInProgress, 1)
+		zipLastRun.Store(time.Now())
+		var files int64
+		var firstErr error
+		thr := threshold()
+		// Walk year/month/day/hour folders only when strictly before threshold hour
+		years, _ := os.ReadDir(root)
+		for _, y := range years {
+			if !y.IsDir() {
+				continue
+			}
+			yi, err := strconv.Atoi(y.Name())
+			if err != nil {
+				if firstErr == nil {
+					firstErr = err
+				}
+				continue
+			}
+			months, _ := os.ReadDir(filepath.Join(root, y.Name()))
+			for _, m := range months {
+				if !m.IsDir() {
+					continue
+				}
+				mi, err := strconv.Atoi(m.Name())
+				if err != nil || mi < 1 || mi > 12 {
+					if err != nil && firstErr == nil {
+						firstErr = err
+					}
+					continue
+				}
+				days, _ := os.ReadDir(filepath.Join(root, y.Name(), m.Name()))
+				for _, d := range days {
+					if !d.IsDir() {
+						continue
+					}
+					di, err := strconv.Atoi(d.Name())
+					if err != nil || di < 1 || di > 31 {
+						if err != nil && firstErr == nil {
+							firstErr = err
+						}
+						continue
+					}
+					hours, _ := os.ReadDir(filepath.Join(root, y.Name(), m.Name(), d.Name()))
+					for _, h := range hours {
+						if !h.IsDir() {
+							continue
+						}
+						hi, err := strconv.Atoi(h.Name())
+						if err != nil || hi < 0 || hi > 23 {
+							if err != nil && firstErr == nil {
+								firstErr = err
+							}
+							continue
+						}
+						folderTime := time.Date(yi, time.Month(mi), di, hi, 0, 0, 0, time.UTC)
+						if !folderTime.Before(thr) {
+							continue
+						}
+						hourDir := filepath.Join(root, y.Name(), m.Name(), d.Name(), h.Name())
+						// Compress any src-port.log / dst-port.log found under this hour directory
+						_ = filepath.Walk(hourDir, func(p string, info os.FileInfo, err error) error {
+							if err != nil {
+								if firstErr == nil {
+									firstErr = err
+								}
+								return nil
+							}
+							if info == nil || info.IsDir() {
+								return nil
+							}
+							base := filepath.Base(p)
+							if base != "src-port.log" && base != "dst-port.log" {
+								return nil
+							}
+							zipPath := p + ".zip"
+							if st, err := os.Stat(zipPath); err == nil && !st.IsDir() {
+								// zip already exists; remove plain log if present
+								_ = os.Remove(p)
+								return nil
+							}
+							src, err := os.Open(p)
+							if err != nil {
+								if firstErr == nil {
+									firstErr = err
+								}
+								return nil
+							}
+							tmp := zipPath + ".tmp"
+							zf, err := os.OpenFile(tmp, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o644)
+							if err != nil {
+								_ = src.Close()
+								if firstErr == nil {
+									firstErr = err
+								}
+								return nil
+							}
+							zw := zip.NewWriter(zf)
+							w, err := zw.Create(base)
+							if err != nil {
+								_ = src.Close()
+								_ = zw.Close()
+								_ = zf.Close()
+								_ = os.Remove(tmp)
+								if firstErr == nil {
+									firstErr = err
+								}
+								return nil
+							}
+							_, _ = io.Copy(w, src)
+							_ = src.Close()
+							if err := zw.Close(); err != nil {
+								_ = zf.Close()
+								_ = os.Remove(tmp)
+								if firstErr == nil {
+									firstErr = err
+								}
+								return nil
+							}
+							_ = zf.Close()
+							// Atomically move tmp into place, then remove original
+							if err := os.Rename(tmp, zipPath); err == nil {
+								_ = os.Remove(p)
+								files++
+							} else {
+								_ = os.Remove(tmp)
+								if firstErr == nil {
+									firstErr = err
+								}
+							}
+							return nil
+						})
+					}
+				}
+			}
+		}
+		atomic.StoreInt64(&zipLastFilesCompressed, files)
+		if firstErr != nil {
+			zipLastError.Store(firstErr.Error())
+		} else {
+			zipLastError.Store("")
+		}
+		atomic.StoreInt32(&zipInProgress, 0)
+	}
+
+	go func() {
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+		zipNextRun.Store(time.Now().Add(interval))
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				if atomic.LoadInt32(&zipInProgress) == 0 {
+					compressOnce()
+				}
+				zipNextRun.Store(time.Now().Add(interval))
+			case <-zipTrigger:
+				if !zipEnabled {
+					continue
+				}
+				if atomic.LoadInt32(&zipInProgress) == 0 {
+					compressOnce()
+				}
+				zipNextRun.Store(time.Now().Add(interval))
+			}
+		}
+	}()
+}
+
 // scanIPLogs scans filesystem logs for the given IP and filters with pagination.
 func scanIPLogs(root string, ip string, since, until time.Time, side string, filters fsLogFilters, offset, limit int) ([]fsLogItem, bool, error) {
 	ip = strings.TrimSpace(ip)
@@ -2812,12 +3084,12 @@ func scanIPLogs(root string, ip string, since, until time.Time, side string, fil
 			} else if name == "dst-port.log" {
 				sideName = "dst"
 			}
-			f, err := os.Open(path)
+			r, err := openLogReader(path)
 			if err != nil {
 				continue
 			}
-			defer f.Close()
-			sc := bufio.NewScanner(f)
+			defer r.Close()
+			sc := bufio.NewScanner(r)
 			for sc.Scan() {
 				line := strings.TrimSpace(sc.Text())
 				if line == "" {
@@ -2904,11 +3176,11 @@ func scanIPLogs(root string, ip string, since, until time.Time, side string, fil
 					})
 				} else {
 					hasMore = true
-					_ = f.Close()
+					_ = r.Close()
 					return out, hasMore, nil
 				}
 			}
-			_ = f.Close()
+			_ = r.Close()
 		}
 	}
 	return out, hasMore, nil
@@ -2951,15 +3223,19 @@ func scanAllLogsForIP(root string, ip string, since, until time.Time, side strin
 				return nil
 			}
 			base := filepath.Base(path)
-			if base != "src-port.log" && base != "dst-port.log" {
+			if base != "src-port.log" && base != "dst-port.log" && base != "src-port.zip" && base != "dst-port.zip" {
 				return nil
 			}
-			f, err := os.Open(path)
+			noZipPath := path
+			if strings.HasSuffix(strings.ToLower(base), ".zip") {
+				noZipPath = strings.TrimSuffix(path, ".zip")
+			}
+			r, err := openLogReader(noZipPath)
 			if err != nil {
 				return nil
 			}
-			defer f.Close()
-			sc := bufio.NewScanner(f)
+			defer r.Close()
+			sc := bufio.NewScanner(r)
 			for sc.Scan() {
 				line := strings.TrimSpace(sc.Text())
 				if line == "" {
@@ -3068,11 +3344,11 @@ func scanAllLogsForIP(root string, ip string, since, until time.Time, side strin
 					})
 				} else {
 					hasMore = true
-					_ = f.Close()
+					_ = r.Close()
 					return stopErr
 				}
 			}
-			_ = f.Close()
+			_ = r.Close()
 			return nil
 		})
 		if hasMore || (limit > 0 && len(out) >= limit) {
@@ -3505,26 +3781,21 @@ func wsSessionsHandler(w http.ResponseWriter, r *http.Request) {
 	}(c)
 }
 
-// getenv returns a configuration value with precedence: Environment > INI file > default.
+// getenv returns a configuration value using INI only (no environment override). Falls back to default if missing.
 func getenv(k, def string) string {
-	if v := os.Getenv(k); v != "" {
-		return v
-	}
 	if v, ok := getINI(k); ok && strings.TrimSpace(v) != "" {
 		return v
 	}
 	return def
 }
 
-// getenvBool reads a configuration value as a boolean with a default.
+// getenvBool reads a configuration value as a boolean from INI only, with a default.
 // Truthy values: 1, true, yes, y, on (case-insensitive).
 // Falsy values: 0, false, no, n, off (case-insensitive).
 func getenvBool(k string, def bool) bool {
-	v := strings.TrimSpace(strings.ToLower(os.Getenv(k)))
-	if v == "" {
-		if iniV, ok := getINI(k); ok {
-			v = strings.TrimSpace(strings.ToLower(iniV))
-		}
+	v := ""
+	if iniV, ok := getINI(k); ok {
+		v = strings.TrimSpace(strings.ToLower(iniV))
 	}
 	if v == "" {
 		return def
@@ -3539,13 +3810,11 @@ func getenvBool(k string, def bool) bool {
 	}
 }
 
-// getenvInt reads a configuration value as int with default value.
+// getenvInt reads a configuration value as int from INI only, with default value.
 func getenvInt(k string, def int) int {
-	v := strings.TrimSpace(os.Getenv(k))
-	if v == "" {
-		if iniV, ok := getINI(k); ok {
-			v = strings.TrimSpace(iniV)
-		}
+	v := ""
+	if iniV, ok := getINI(k); ok {
+		v = strings.TrimSpace(iniV)
 	}
 	if v == "" {
 		return def
@@ -3702,6 +3971,12 @@ func startUDPCollectorWithWorkers(ctx context.Context, addr, name string) {
 		recv time.Time
 	}
 	queue := make(chan udpPacket, collectorQueue)
+	// record queue capacity for status
+	if strings.EqualFold(name, "NETFLOW") {
+		atomic.StoreInt64(&netflowQueueCap, int64(cap(queue)))
+	} else if strings.EqualFold(name, "IPFIX") {
+		atomic.StoreInt64(&ipfixQueueCap, int64(cap(queue)))
+	}
 	// Start workers
 	for i := 0; i < collectorWorkers; i++ {
 		go func(id int) {
@@ -3710,6 +3985,12 @@ func startUDPCollectorWithWorkers(ctx context.Context, addr, name string) {
 				case <-ctx.Done():
 					return
 				case pkt := <-queue:
+					// update inbound queue depth gauge after dequeue
+					if strings.EqualFold(name, "NETFLOW") {
+						atomic.StoreInt64(&collectorQueueDepthNetflow, int64(len(queue)))
+					} else if strings.EqualFold(name, "IPFIX") {
+						atomic.StoreInt64(&collectorQueueDepthIPFIX, int64(len(queue)))
+					}
 					records := parseNetFlowPacket(pkt.data, pkt.src, pkt.recv)
 					if len(records) == 0 {
 						continue
@@ -3739,6 +4020,10 @@ func startUDPCollectorWithWorkers(ctx context.Context, addr, name string) {
 			continue
 		}
 		recvTime := time.Now()
+		// record router last-seen time
+		if src != nil && src.IP != nil {
+			recentRouters.Set(src.IP.String(), recvTime.Unix())
+		}
 		b := make([]byte, n)
 		copy(b, buf[:n])
 		pkt := udpPacket{data: b, src: src, recv: recvTime}
@@ -3746,6 +4031,12 @@ func startUDPCollectorWithWorkers(ctx context.Context, addr, name string) {
 		case <-ctx.Done():
 			return
 		case queue <- pkt:
+			// update inbound queue depth gauge after enqueue
+			if strings.EqualFold(name, "NETFLOW") {
+				atomic.StoreInt64(&collectorQueueDepthNetflow, int64(len(queue)))
+			} else if strings.EqualFold(name, "IPFIX") {
+				atomic.StoreInt64(&collectorQueueDepthIPFIX, int64(len(queue)))
+			}
 		}
 	}
 }
@@ -3754,6 +4045,9 @@ func startUDPCollectorWithWorkers(ctx context.Context, addr, name string) {
 func startFlowCollectors(ctx context.Context) {
 	nfAddr := getenv("NETFLOW_ADDR", "0.0.0.0:2055")
 	ipfixAddr := getenv("IPFIX_ADDR", "0.0.0.0:4739")
+	// record configured addresses for status page
+	netflowAddrCfg = nfAddr
+	ipfixAddrCfg = ipfixAddr
 	if nfAddr != "" {
 		go startUDPCollectorWithWorkers(ctx, nfAddr, "NETFLOW")
 	}
@@ -3797,6 +4091,10 @@ func startNetFlowCollector(ctx context.Context, addr string) {
 			continue
 		}
 		recvTime := time.Now()
+		// record router last-seen time
+		if src != nil && src.IP != nil {
+			recentRouters.Set(src.IP.String(), recvTime.Unix())
+		}
 		records := parseNetFlowPacket(buf[:n], src, recvTime)
 		for _, rec := range records {
 			r := rec
@@ -3844,6 +4142,10 @@ func startIPFIXCollector(ctx context.Context, addr string) {
 			continue
 		}
 		recvTime := time.Now()
+		// record router last-seen time
+		if src != nil && src.IP != nil {
+			recentRouters.Set(src.IP.String(), recvTime.Unix())
+		}
 		records := parseNetFlowPacket(buf[:n], src, recvTime) // parser handles v10 as IPFIX
 		for _, rec := range records {
 			r := rec
@@ -5582,6 +5884,7 @@ func ipTableIndexHandler(w http.ResponseWriter, r *http.Request) {
     </label>
     <button id="refresh">Refresh</button>
     <button id="badIpsBtn" title="View IPs that probed without response" onclick="window.location.href='/bad-ips'">Bad IPs</button>
+	<button id="statusBtn" title="View server status" onclick="window.location.href='/status'">Server Status</button>
     <small class="m">Only IPs within logging prefix list are shown.</small>
     <small class="m" id="sessInfo" style="margin-left:1rem">Total sessions: <span id="sessionsTotal">-</span></small>
   </div>
@@ -6327,6 +6630,20 @@ window.addEventListener('DOMContentLoaded', function(){
 
 var iniConfig map[string]string
 
+// cfgOrder defines the canonical order of configuration keys for display and generation.
+var cfgOrder = []string{
+	"ADDR", "PORT",
+	"PPROF_ENABLE", "LOG_REQUESTS", "SERVICE_DISABLE",
+	"RETENTION_MINUTES", "FLOW_TIMEOUT_MINUTES", "COMPACT_EVERY_SECONDS", "MAX_SESSIONS_TRIGGER",
+	"METRICS_RETENTION_HOURS",
+	"COLLECTOR_WORKERS", "COLLECTOR_QUEUE",
+	"WS_MAX_CONNS",
+	"DEDUP_ENABLE", "DEDUP_TTL_MIN",
+	"TSDB_ENABLE", "TSDB_ROOT", "TSDB_SHARDS", "TSDB_QUEUE_SIZE", "TSDB_FLUSH_MS", "TSDB_IDLE_CLOSE_SEC", "TSDB_LOG_DROPS", "TSDB_LOG_ERRORS", "TSDB_FILTER_CIDRS",
+	"TSDB_ZIP_ENABLE", "TSDB_ZIP_EVERY_MINUTES", "TSDB_ZIP_OLDER_THAN_HOURS",
+	"NETFLOW_ADDR", "IPFIX_ADDR",
+}
+
 // getINI returns a value from the loaded INI by key (case-insensitive).
 func getINI(k string) (string, bool) {
 	if iniConfig == nil {
@@ -6368,55 +6685,46 @@ func loadINIConfig() {
 			return "0"
 		}
 		cfg := map[string]string{
-			"ADDR":                    getenv("ADDR", "0.0.0.0"),
-			"PORT":                    getenv("PORT", "8080"),
-			"RETENTION_MINUTES":       strconv.Itoa(getenvInt("RETENTION_MINUTES", retentionMinutes)),
-			"FLOW_TIMEOUT_MINUTES":    strconv.Itoa(getenvInt("FLOW_TIMEOUT_MINUTES", flowTimeoutMinutes)),
-			"COMPACT_EVERY_SECONDS":   strconv.Itoa(getenvInt("COMPACT_EVERY_SECONDS", compactEverySeconds)),
-			"MAX_SESSIONS_TRIGGER":    strconv.Itoa(getenvInt("MAX_SESSIONS_TRIGGER", maxSessionsBeforeCompactTrigger)),
-			"METRICS_RETENTION_HOURS": strconv.Itoa(getenvInt("METRICS_RETENTION_HOURS", summariesRetentionHours)),
-			"COLLECTOR_WORKERS":       strconv.Itoa(getenvInt("COLLECTOR_WORKERS", collectorWorkers)),
-			"COLLECTOR_QUEUE":         strconv.Itoa(getenvInt("COLLECTOR_QUEUE", collectorQueue)),
-			"WS_MAX_CONNS":            strconv.Itoa(getenvInt("WS_MAX_CONNS", wsMaxConns)),
-			"PPROF_ENABLE":            bool01(getenvBool("PPROF_ENABLE", false)),
-			"LOG_REQUESTS":            bool01(getenvBool("LOG_REQUESTS", false)),
-			"SERVICE_DISABLE":         bool01(getenvBool("SERVICE_DISABLE", false)),
-			"DEDUP_ENABLE":            bool01(getenvBool("DEDUP_ENABLE", true)),
-			"DEDUP_TTL_MIN":           strconv.Itoa(getenvInt("DEDUP_TTL_MIN", 1)),
-			"TSDB_ENABLE":             bool01(getenvBool("TSDB_ENABLE", true)),
-			"TSDB_ROOT":               getenv("TSDB_ROOT", "E:\\DB"),
-			"TSDB_SHARDS":             strconv.Itoa(getenvInt("TSDB_SHARDS", runtime.GOMAXPROCS(0))),
-			"TSDB_QUEUE_SIZE":         strconv.Itoa(getenvInt("TSDB_QUEUE_SIZE", 65536)),
-			"TSDB_FLUSH_MS":           strconv.Itoa(getenvInt("TSDB_FLUSH_MS", 1000)),
-			"TSDB_IDLE_CLOSE_SEC":     strconv.Itoa(getenvInt("TSDB_IDLE_CLOSE_SEC", 60)),
-			"TSDB_LOG_DROPS":          bool01(getenvBool("TSDB_LOG_DROPS", false)),
-			"TSDB_LOG_ERRORS":         bool01(getenvBool("TSDB_LOG_ERRORS", true)),
-			"TSDB_FILTER_CIDRS":       getenv("TSDB_FILTER_CIDRS", ""),
-			"NETFLOW_ADDR":            getenv("NETFLOW_ADDR", "0.0.0.0:2055"),
-			"IPFIX_ADDR":              getenv("IPFIX_ADDR", "0.0.0.0:4739"),
+			"ADDR":                      getenv("ADDR", "0.0.0.0"),
+			"PORT":                      getenv("PORT", "8080"),
+			"RETENTION_MINUTES":         strconv.Itoa(getenvInt("RETENTION_MINUTES", retentionMinutes)),
+			"FLOW_TIMEOUT_MINUTES":      strconv.Itoa(getenvInt("FLOW_TIMEOUT_MINUTES", flowTimeoutMinutes)),
+			"COMPACT_EVERY_SECONDS":     strconv.Itoa(getenvInt("COMPACT_EVERY_SECONDS", compactEverySeconds)),
+			"MAX_SESSIONS_TRIGGER":      strconv.Itoa(getenvInt("MAX_SESSIONS_TRIGGER", maxSessionsBeforeCompactTrigger)),
+			"METRICS_RETENTION_HOURS":   strconv.Itoa(getenvInt("METRICS_RETENTION_HOURS", summariesRetentionHours)),
+			"COLLECTOR_WORKERS":         strconv.Itoa(getenvInt("COLLECTOR_WORKERS", collectorWorkers)),
+			"COLLECTOR_QUEUE":           strconv.Itoa(getenvInt("COLLECTOR_QUEUE", collectorQueue)),
+			"WS_MAX_CONNS":              strconv.Itoa(getenvInt("WS_MAX_CONNS", wsMaxConns)),
+			"PPROF_ENABLE":              bool01(getenvBool("PPROF_ENABLE", false)),
+			"LOG_REQUESTS":              bool01(getenvBool("LOG_REQUESTS", false)),
+			"SERVICE_DISABLE":           bool01(getenvBool("SERVICE_DISABLE", false)),
+			"DEDUP_ENABLE":              bool01(getenvBool("DEDUP_ENABLE", true)),
+			"DEDUP_TTL_MIN":             strconv.Itoa(getenvInt("DEDUP_TTL_MIN", 1)),
+			"TSDB_ENABLE":               bool01(getenvBool("TSDB_ENABLE", true)),
+			"TSDB_ROOT":                 getenv("TSDB_ROOT", "E:\\DB"),
+			"TSDB_SHARDS":               strconv.Itoa(getenvInt("TSDB_SHARDS", runtime.GOMAXPROCS(0))),
+			"TSDB_QUEUE_SIZE":           strconv.Itoa(getenvInt("TSDB_QUEUE_SIZE", 65536)),
+			"TSDB_FLUSH_MS":             strconv.Itoa(getenvInt("TSDB_FLUSH_MS", 1000)),
+			"TSDB_IDLE_CLOSE_SEC":       strconv.Itoa(getenvInt("TSDB_IDLE_CLOSE_SEC", 60)),
+			"TSDB_LOG_DROPS":            bool01(getenvBool("TSDB_LOG_DROPS", false)),
+			"TSDB_LOG_ERRORS":           bool01(getenvBool("TSDB_LOG_ERRORS", true)),
+			"TSDB_FILTER_CIDRS":         getenv("TSDB_FILTER_CIDRS", ""),
+			"TSDB_ZIP_ENABLE":           bool01(getenvBool("TSDB_ZIP_ENABLE", true)),
+			"TSDB_ZIP_EVERY_MINUTES":    strconv.Itoa(getenvInt("TSDB_ZIP_EVERY_MINUTES", 5)),
+			"TSDB_ZIP_OLDER_THAN_HOURS": strconv.Itoa(getenvInt("TSDB_ZIP_OLDER_THAN_HOURS", 2)),
+			"NETFLOW_ADDR":              getenv("NETFLOW_ADDR", "0.0.0.0:2055"),
+			"IPFIX_ADDR":                getenv("IPFIX_ADDR", "0.0.0.0:4739"),
 		}
 
-		// Stable order for readability
-		order := []string{
-			"ADDR", "PORT",
-			"PPROF_ENABLE", "LOG_REQUESTS", "SERVICE_DISABLE",
-			"RETENTION_MINUTES", "FLOW_TIMEOUT_MINUTES", "COMPACT_EVERY_SECONDS", "MAX_SESSIONS_TRIGGER",
-			"METRICS_RETENTION_HOURS",
-			"COLLECTOR_WORKERS", "COLLECTOR_QUEUE",
-			"WS_MAX_CONNS",
-			"DEDUP_ENABLE", "DEDUP_TTL_MIN",
-			"TSDB_ENABLE", "TSDB_ROOT", "TSDB_SHARDS", "TSDB_QUEUE_SIZE", "TSDB_FLUSH_MS", "TSDB_IDLE_CLOSE_SEC", "TSDB_LOG_DROPS", "TSDB_LOG_ERRORS", "TSDB_FILTER_CIDRS",
-			"NETFLOW_ADDR", "IPFIX_ADDR",
-		}
-
+		// Stable order for readability (use global cfgOrder)
 		var b strings.Builder
 		b.WriteString("; FlowAnalyzer.ini\n")
 		b.WriteString("; Auto-generated on ")
 		b.WriteString(time.Now().Format(time.RFC3339))
 		b.WriteString("\n; Place this file next to FlowAnalyzer.exe.\n")
-		b.WriteString("; Environment variables, if set, override these values.\n")
+		b.WriteString("; Environment variables are ignored; edit this file to configure.\n")
 		b.WriteString("; Boolean values use 1/0 (true/false).\n\n")
-		for _, k := range order {
+		for _, k := range cfgOrder {
 			if v, ok := cfg[k]; ok {
 				b.WriteString(k)
 				b.WriteString("=")
@@ -6474,4 +6782,346 @@ func loadINIConfig() {
 
 func init() {
 	loadINIConfig()
+	// initialize recent routers map
+	recentRouters = cmap.New[int64]()
+	// initialize router minute flows map
+	routerMinuteFlows = cmap.New[int64]()
+}
+
+// --- Status page & metrics additions ---
+var appStart = time.Now()
+
+// ZIP compressor runtime metrics
+var (
+	zipEnabled             = true
+	zipInProgress          int32 // 1 while compressOnce is running
+	zipLastFilesCompressed int64
+)
+
+var zipLastRun atomic.Value   // time.Time
+var zipLastError atomic.Value // string
+var zipNextRun atomic.Value   // time.Time
+var zipInterval time.Duration
+var zipTrigger chan struct{}
+
+// Collector configuration and queue metrics
+var (
+	netflowAddrCfg             string
+	ipfixAddrCfg               string
+	collectorQueueDepthNetflow int64
+	collectorQueueDepthIPFIX   int64
+	netflowQueueCap            int64
+	ipfixQueueCap              int64
+)
+
+// recentRouters tracks last-seen UNIX seconds for exporter routers (by source IP)
+var recentRouters cmap.ConcurrentMap[string, int64]
+
+// routerMinuteFlows counts number of flow records received per router per unix minute (UTC)
+var routerMinuteFlows cmap.ConcurrentMap[string, int64]
+
+// effectiveConfig builds a map of all recognized configuration keys and their effective values
+// as used by the running application (values sourced from INI; defaults applied where missing).
+func effectiveConfig() map[string]string {
+	bool01 := func(b bool) string {
+		if b {
+			return "1"
+		}
+		return "0"
+	}
+	cfg := make(map[string]string)
+	cfg["ADDR"] = getenv("ADDR", "0.0.0.0")
+	cfg["PORT"] = getenv("PORT", "8080")
+	cfg["PPROF_ENABLE"] = bool01(getenvBool("PPROF_ENABLE", false))
+	cfg["LOG_REQUESTS"] = bool01(getenvBool("LOG_REQUESTS", false))
+	cfg["SERVICE_DISABLE"] = bool01(getenvBool("SERVICE_DISABLE", false))
+	cfg["RETENTION_MINUTES"] = strconv.Itoa(getenvInt("RETENTION_MINUTES", retentionMinutes))
+	cfg["FLOW_TIMEOUT_MINUTES"] = strconv.Itoa(getenvInt("FLOW_TIMEOUT_MINUTES", flowTimeoutMinutes))
+	cfg["COMPACT_EVERY_SECONDS"] = strconv.Itoa(getenvInt("COMPACT_EVERY_SECONDS", compactEverySeconds))
+	cfg["MAX_SESSIONS_TRIGGER"] = strconv.Itoa(getenvInt("MAX_SESSIONS_TRIGGER", maxSessionsBeforeCompactTrigger))
+	cfg["METRICS_RETENTION_HOURS"] = strconv.Itoa(getenvInt("METRICS_RETENTION_HOURS", summariesRetentionHours))
+	cfg["COLLECTOR_WORKERS"] = strconv.Itoa(getenvInt("COLLECTOR_WORKERS", collectorWorkers))
+	cfg["COLLECTOR_QUEUE"] = strconv.Itoa(getenvInt("COLLECTOR_QUEUE", collectorQueue))
+	cfg["WS_MAX_CONNS"] = strconv.Itoa(getenvInt("WS_MAX_CONNS", wsMaxConns))
+	cfg["DEDUP_ENABLE"] = bool01(getenvBool("DEDUP_ENABLE", true))
+	cfg["DEDUP_TTL_MIN"] = strconv.Itoa(getenvInt("DEDUP_TTL_MIN", 1))
+	cfg["TSDB_ENABLE"] = bool01(getenvBool("TSDB_ENABLE", true))
+	cfg["TSDB_ROOT"] = getenv("TSDB_ROOT", "E:\\DB")
+	cfg["TSDB_SHARDS"] = strconv.Itoa(getenvInt("TSDB_SHARDS", runtime.GOMAXPROCS(0)))
+	cfg["TSDB_QUEUE_SIZE"] = strconv.Itoa(getenvInt("TSDB_QUEUE_SIZE", 65536))
+	cfg["TSDB_FLUSH_MS"] = strconv.Itoa(getenvInt("TSDB_FLUSH_MS", 1000))
+	cfg["TSDB_IDLE_CLOSE_SEC"] = strconv.Itoa(getenvInt("TSDB_IDLE_CLOSE_SEC", 60))
+	cfg["TSDB_LOG_DROPS"] = bool01(getenvBool("TSDB_LOG_DROPS", false))
+	cfg["TSDB_LOG_ERRORS"] = bool01(getenvBool("TSDB_LOG_ERRORS", true))
+	cfg["TSDB_FILTER_CIDRS"] = getenv("TSDB_FILTER_CIDRS", "")
+	cfg["TSDB_ZIP_ENABLE"] = bool01(getenvBool("TSDB_ZIP_ENABLE", true))
+	cfg["TSDB_ZIP_EVERY_MINUTES"] = strconv.Itoa(getenvInt("TSDB_ZIP_EVERY_MINUTES", 5))
+	cfg["TSDB_ZIP_OLDER_THAN_HOURS"] = strconv.Itoa(getenvInt("TSDB_ZIP_OLDER_THAN_HOURS", 2))
+	cfg["NETFLOW_ADDR"] = getenv("NETFLOW_ADDR", "0.0.0.0:2055")
+	cfg["IPFIX_ADDR"] = getenv("IPFIX_ADDR", "0.0.0.0:4739")
+	return cfg
+}
+
+// statusAPIHandler returns runtime/application metrics for the status screen
+func statusAPIHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	// basic runtime
+	var ms runtime.MemStats
+	runtime.ReadMemStats(&ms)
+
+	// sessions total
+	store.mu.RLock()
+	sessTotal := len(store.sessions)
+	store.mu.RUnlock()
+
+	// recent senders (5 minutes) — show exporter routers that sent us metrics recently
+	recentSenders := func() []string {
+		cut := time.Now().Add(-5 * time.Minute).Unix()
+		out := make([]string, 0)
+		for ip, last := range recentRouters.Items() {
+			if last >= cut {
+				out = append(out, ip)
+			}
+		}
+		sort.Strings(out)
+		return out
+	}()
+
+	// TSDB stats
+	tsdbStats := map[string]any{"enabled": false}
+	if tsdb != nil && tsdb.enabled {
+		qLens := make([]int, 0, len(tsdb.queues))
+		qCaps := make([]int, 0, len(tsdb.queues))
+		for _, ch := range tsdb.queues {
+			qLens = append(qLens, len(ch))
+			qCaps = append(qCaps, cap(ch))
+		}
+		tsdbStats = map[string]any{
+			"enabled":   true,
+			"root":      tsdb.root,
+			"shards":    tsdb.shards,
+			"queue_len": qLens,
+			"queue_cap": qCaps,
+			"accepted":  atomic.LoadUint64(&tsdb.accepted),
+			"dropped":   atomic.LoadUint64(&tsdb.dropped),
+		}
+	}
+
+	// ZIP stats
+	var lastRun string
+	if v := zipLastRun.Load(); v != nil {
+		if t, ok := v.(time.Time); ok && !t.IsZero() {
+			lastRun = t.Format(time.RFC3339)
+		}
+	}
+	var nextRun string
+	if v := zipNextRun.Load(); v != nil {
+		if t, ok := v.(time.Time); ok && !t.IsZero() {
+			nextRun = t.Format(time.RFC3339)
+		}
+	}
+	var lastErr string
+	if v := zipLastError.Load(); v != nil {
+		if s, ok := v.(string); ok {
+			lastErr = s
+		}
+	}
+
+	// recent senders with counts (5 minutes)
+	recentSendersCounts := func() []map[string]any {
+		if len(recentSenders) == 0 {
+			return nil
+		}
+		nowMin := minuteBucketUnix(time.Now())
+		// build set to ensure order by flows desc
+		items := make([]map[string]any, 0, len(recentSenders))
+		for _, ip := range recentSenders {
+			var sum int64
+			for i := 0; i < 5; i++ {
+				m := nowMin - int64(i*60)
+				key := fmt.Sprintf("%s|%d", ip, m)
+				if v, ok := routerMinuteFlows.Get(key); ok {
+					sum += v
+				}
+			}
+			items = append(items, map[string]any{"ip": ip, "flows_5m": sum})
+		}
+		// sort by flows desc, ip asc
+		sort.Slice(items, func(i, j int) bool {
+			a := items[i]["flows_5m"].(int64)
+			b := items[j]["flows_5m"].(int64)
+			if a == b {
+				return items[i]["ip"].(string) < items[j]["ip"].(string)
+			}
+			return a > b
+		})
+		return items
+	}()
+
+	// Build ordered config list for status page (include all keys, including ZIP)
+	confMap := effectiveConfig()
+	configList := make([]map[string]string, 0, len(cfgOrder))
+	for _, k := range cfgOrder {
+		configList = append(configList, map[string]string{"key": k, "value": confMap[k]})
+	}
+	data := map[string]any{
+		"time":       time.Now().Format(time.RFC3339),
+		"uptime_sec": int64(time.Since(appStart).Seconds()),
+		"goroutines": runtime.NumGoroutine(),
+		"mem": map[string]any{
+			"alloc":             ms.Alloc,
+			"total_alloc":       ms.TotalAlloc,
+			"sys":               ms.Sys,
+			"gc_num":            ms.NumGC,
+			"gc_pause_total_ns": ms.PauseTotalNs,
+		},
+		"processes": map[string]any{
+			"netflow": map[string]any{"running": netflowAddrCfg != "", "addr": netflowAddrCfg, "queue_len": atomic.LoadInt64(&collectorQueueDepthNetflow), "queue_cap": atomic.LoadInt64(&netflowQueueCap)},
+			"ipfix":   map[string]any{"running": ipfixAddrCfg != "", "addr": ipfixAddrCfg, "queue_len": atomic.LoadInt64(&collectorQueueDepthIPFIX), "queue_cap": atomic.LoadInt64(&ipfixQueueCap)},
+			"tsdb":    tsdbStats,
+			"zip":     map[string]any{"enabled": zipEnabled, "in_progress": atomic.LoadInt32(&zipInProgress) == 1, "last_run": lastRun, "next_run": nextRun, "last_files": atomic.LoadInt64(&zipLastFilesCompressed), "last_error": lastErr},
+		},
+		"sessions_total":           sessTotal,
+		"recent_senders_5m":        recentSenders,
+		"recent_senders_5m_counts": recentSendersCounts,
+		"config":                   configList,
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	enc := json.NewEncoder(w)
+	_ = enc.Encode(data)
+}
+
+// Minimal status page
+func zipRunNowHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	// If ZIP enablement not known yet, derive from environment (default on)
+	if zipTrigger == nil && zipEnabled { // attempt lazy start if not running
+		root := ""
+		if tsdb != nil && tsdb.enabled {
+			root = tsdb.root
+		} else {
+			root = getenv("TSDB_ROOT", "E:\\DB")
+		}
+		startZipCompressor(context.Background(), root)
+	}
+	if !zipEnabled {
+		http.Error(w, "zip disabled", http.StatusServiceUnavailable)
+		return
+	}
+	if zipTrigger == nil {
+		http.Error(w, "zip scheduler not started", http.StatusServiceUnavailable)
+		return
+	}
+	if atomic.LoadInt32(&zipInProgress) == 1 {
+		http.Error(w, "zip already in progress", http.StatusConflict)
+		return
+	}
+	select {
+	case zipTrigger <- struct{}{}:
+	default:
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusAccepted)
+	_, _ = w.Write([]byte(`{"status":"triggered"}`))
+}
+
+func statusPageHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	_, _ = w.Write([]byte(`<!doctype html>
+<html><head><meta charset="utf-8"><title>FlowAnalyzer Status</title>
+<style>
+ body{font-family: Segoe UI,Arial,sans-serif; margin:1rem;}
+ h1{margin:0 0 .5rem 0}
+ .muted{color:#666}
+ table{border-collapse:collapse}
+ th,td{padding:.25rem .5rem;border-bottom:1px solid #ddd}
+ .ok{color:#080} .bad{color:#a00}
+ .bar{height:8px;background:#eee;border-radius:4px;overflow:hidden}
+ .bar>span{display:block;height:100%;background:#6ba1ff}
+ .grid{display:grid;grid-template-columns:1fr 1fr;gap:1rem}
+ @media(max-width:900px){.grid{grid-template-columns:1fr}}
+</style>
+</head>
+<body>
+<h1>FlowAnalyzer Status</h1>
+<div class="muted" id="uptime"></div>
+<div class="grid">
+<div>
+  <h3>Processes</h3>
+  <div>NetFlow: <span id="nf"></span><div class="bar"><span id="nfBar" style="width:0%"></span></div></div>
+  <div>IPFIX: <span id="ipfix"></span><div class="bar"><span id="ipfixBar" style="width:0%"></span></div></div>
+  <div>TSDB: <span id="tsdb"></span></div>
+  <div>ZIP: <span id="zip"></span></div>
+  <div>Next ZIP: <span id="zipNext"></span> <button id="zipRunNow" title="Force ZIP compression to start now">Run ZIP Now</button></div>
+</div>
+<div>
+  <h3>Runtime</h3>
+  <div>Goroutines: <span id="gr"></span></div>
+  <div>Memory: <span id="mem"></span></div>
+  <div>Total Sessions: <span id="sess"></span></div>
+</div>
+</div>
+<div>
+  <h3>Configuration</h3>
+  <div id="cfg" style="max-height:300px;overflow:auto;border:1px solid #ddd;padding:.25rem"></div>
+</div>
+<div>
+  <h3>Recent Senders (5 min)</h3>
+  <div id="senders" style="max-height:260px;overflow:auto;border:1px solid #ddd;padding:.25rem"></div>
+</div>
+<script>
+async function load(){
+  const r = await fetch('/api/status', {cache:'no-store'});
+  if(!r.ok){ return; }
+  const d = await r.json();
+  document.getElementById('uptime').textContent = 'Uptime '+Math.floor(d.uptime_sec)+'s, '+new Date(d.time).toLocaleString();
+  document.getElementById('gr').textContent = d.goroutines;
+  const m=d.mem; document.getElementById('mem').textContent = (m.alloc/1048576).toFixed(1)+' MiB alloc, GC '+m.gc_num;
+  document.getElementById('sess').textContent = d.sessions_total;
+  const p=d.processes;
+  function pct(len,cap){ if(!cap) return 0; return Math.min(100, Math.round((len*100)/cap)); }
+  // NetFlow
+  const nf=p.netflow; document.getElementById('nf').textContent = (nf.running?('running '+nf.addr):'disabled')+' - queue '+nf.queue_len+'/'+nf.queue_cap+' ('+pct(nf.queue_len,nf.queue_cap)+'%)';
+  document.getElementById('nfBar').style.width=pct(nf.queue_len,nf.queue_cap)+'%';
+  // IPFIX
+  const ip=p.ipfix; document.getElementById('ipfix').textContent = (ip.running?('running '+ip.addr):'disabled')+' - queue '+ip.queue_len+'/'+ip.queue_cap+' ('+pct(ip.queue_len,ip.queue_cap)+'%)';
+  document.getElementById('ipfixBar').style.width=pct(ip.queue_len,ip.queue_cap)+'%';
+  // TSDB
+  const t=p.tsdb; if(t.enabled){ let used=0,cap=0; (t.queue_len||[]).forEach((x,i)=>{used+=x; cap+=(t.queue_cap||[])[i]||0;}); const pr=pct(used,cap);
+    document.getElementById('tsdb').textContent = 'enabled shards='+t.shards+' accepted='+t.accepted+' dropped='+t.dropped+' queue '+used+'/'+cap+' ('+pr+'%)';
+  } else { document.getElementById('tsdb').textContent = 'disabled'; }
+  // ZIP
+  const z=p.zip; document.getElementById('zip').textContent = (z.enabled?(z.in_progress?'in progress':'idle'):'disabled')+(z.last_run?(' last_run='+z.last_run):'')+(z.last_error?(' err='+z.last_error):'');
+  // ZIP next run + button
+  const zipNextEl=document.getElementById('zipNext');
+  if(zipNextEl){
+    function fmtETA(next, now){ try{ const tn=new Date(next).getTime(); const t0=new Date(now||d.time).getTime(); let s=Math.max(0, Math.round((tn-t0)/1000)); const m=Math.floor(s/60); s=s%60; return m+'m '+s+'s'; }catch(e){ return 'n/a'; } }
+    if(z.next_run){ zipNextEl.textContent = fmtETA(z.next_run, d.time)+' (at '+new Date(z.next_run).toLocaleTimeString()+')'; } else { zipNextEl.textContent = 'n/a'; }
+  }
+  const runBtn=document.getElementById('zipRunNow');
+  if(runBtn){ runBtn.disabled = !z.enabled || z.in_progress; runBtn.onclick = async ()=>{ try{ runBtn.disabled=true; await fetch('/api/zip/run_now',{method:'POST'}); }catch(e){} setTimeout(load,500); }; }
+  // Config table
+  const cfgDiv=document.getElementById('cfg'); if(cfgDiv){ cfgDiv.innerHTML=''; const cfgTbl=document.createElement('table'); cfgTbl.innerHTML='<thead><tr><th>Key</th><th>Value</th></tr></thead><tbody></tbody>'; const ctb=cfgTbl.querySelector('tbody'); (d.config||[]).forEach(kv=>{ const tr=document.createElement('tr'); const k=document.createElement('td'); k.textContent=kv.key; const v=document.createElement('td'); v.textContent=kv.value==null?'':String(kv.value); tr.appendChild(k); tr.appendChild(v); ctb.appendChild(tr); }); cfgDiv.appendChild(cfgTbl); }
+
+  // Senders table
+  const div=document.getElementById('senders'); div.innerHTML='';
+  const rows = (d.recent_senders_5m_counts && d.recent_senders_5m_counts.length)? d.recent_senders_5m_counts : (d.recent_senders_5m||[]).map(ip=>({ip, flows_5m:0}));
+  const tbl=document.createElement('table'); tbl.innerHTML='<thead><tr><th>Router</th><th>Flows (5m)</th></tr></thead><tbody></tbody>';
+  const tb=tbl.querySelector('tbody'); rows.forEach(rw=>{ const tr=document.createElement('tr'); const td1=document.createElement('td'); td1.textContent=rw.ip; const td2=document.createElement('td'); td2.textContent=String(rw.flows_5m||0); td2.style.textAlign='right'; tr.appendChild(td1); tr.appendChild(td2); tb.appendChild(tr); });
+  div.appendChild(tbl);
+}
+load(); setInterval(load, 5000);
+</script>
+</body></html>`))
 }
