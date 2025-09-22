@@ -10,6 +10,12 @@ A lightweight NetFlow/IPFIX collector and web UI for quickly exploring network f
 - Windows Service support out of the box, plus cross‑platform console mode
 - INI or environment‑based configuration
 
+### Project status
+
+- Last updated: 2025-09-23
+- Actively developed; Windows-first with Linux/macOS console builds supported.
+- Core features (collectors, UI, WebSockets, filesystem TSDB, Windows Service) are implemented and used daily; APIs and internal storage layout may still evolve.
+
 ---
 
 ### Screens and endpoints at a glance
@@ -19,6 +25,7 @@ UI pages:
 - `/logs` dedicated log search page (filter by IP, ports, protocol, time window)
 - `/live` live sessions page (WebSocket powered)
 - `/bad-ips` page listing IPs with repeated no‑response attempts
+- `/status` server status dashboard (queues, memory, recent senders, config; includes ZIP maintenance trigger)
 
 APIs (HTTP JSON):
 - `GET /healthz` health probe
@@ -34,6 +41,8 @@ APIs (HTTP JSON):
 - `GET /api/ip/peers` peers for an IP
 - `GET /api/ip_table` data for the IP table dashboard
 - `GET /api/bad-ips` suspicious/no‑response sources
+- `GET /api/status` server runtime and queue stats
+- `POST /api/zip/run_now` trigger background ZIP compression (if enabled)
 
 WebSockets:
 - `GET /ws/logs` live flow logs feed
