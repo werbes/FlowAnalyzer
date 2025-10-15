@@ -113,7 +113,11 @@ func (f *flowSvc) Execute(args []string, r <-chan svc.ChangeRequest, s chan<- sv
 		idleSec := getenvInt("TSDB_IDLE_CLOSE_SEC", 60)
 		logDrops := getenvBool("TSDB_LOG_DROPS", false)
 		logErrors := getenvBool("TSDB_LOG_ERRORS", true)
-		tsdb = newTSDB(root, shards, qsize, time.Duration(flushMs)*time.Millisecond, time.Duration(idleSec)*time.Second, logDrops, logErrors)
+		wbufKB := getenvInt("TSDB_WRITE_BUFFER_KB", 256)
+		if wbufKB <= 0 {
+			wbufKB = 256
+		}
+		tsdb = newTSDB(root, shards, qsize, time.Duration(flushMs)*time.Millisecond, time.Duration(idleSec)*time.Second, logDrops, logErrors, wbufKB*1024)
 		if cidrs := getenv("TSDB_FILTER_CIDRS", ""); cidrs != "" {
 			tsdb.filterCIDRs = parseCIDRList(cidrs)
 			log.Printf("[svc] TSDB filter: %d CIDRs active", len(tsdb.filterCIDRs))

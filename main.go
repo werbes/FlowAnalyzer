@@ -168,16 +168,17 @@ type flowTrack struct {
 // tsdbWriter asynchronously writes compact flow records to a Windows-friendly time-series folder layout.
 // It is enabled by default (set TSDB_ENABLE=0 to disable) so flows persist without extra configuration.
 type tsdbWriter struct {
-	enabled    bool
-	root       string
-	shards     int
-	queues     []chan tsdbItem
-	flushEvery time.Duration
-	idleClose  time.Duration
-	logDrops   bool
-	logErrors  bool
-	accepted   uint64 // atomic
-	dropped    uint64 // atomic
+	enabled      bool
+	root         string
+	shards       int
+	queues       []chan tsdbItem
+	flushEvery   time.Duration
+	idleClose    time.Duration
+	writeBufSize int
+	logDrops     bool
+	logErrors    bool
+	accepted     uint64 // atomic
+	dropped      uint64 // atomic
 	// Optional IP prefix filter: if empty, log all IPv4; if set, log only when src/dst IP is within any CIDR
 	filterCIDRs []*net.IPNet
 }
@@ -193,7 +194,7 @@ type fileEntry struct {
 	lastUsed time.Time
 }
 
-func newTSDB(root string, shards int, queueSize int, flushEvery time.Duration, idleClose time.Duration, logDrops, logErrors bool) *tsdbWriter {
+func newTSDB(root string, shards int, queueSize int, flushEvery time.Duration, idleClose time.Duration, logDrops, logErrors bool, writeBufSize int) *tsdbWriter {
 	if shards <= 0 {
 		shards = 1
 	}
@@ -201,13 +202,17 @@ func newTSDB(root string, shards int, queueSize int, flushEvery time.Duration, i
 		queueSize = shards * 1024
 	}
 	t := &tsdbWriter{
-		enabled:    true,
-		root:       root,
-		shards:     shards,
-		flushEvery: flushEvery,
-		idleClose:  idleClose,
-		logDrops:   logDrops,
-		logErrors:  logErrors,
+		enabled:      true,
+		root:         root,
+		shards:       shards,
+		flushEvery:   flushEvery,
+		idleClose:    idleClose,
+		writeBufSize: writeBufSize,
+		logDrops:     logDrops,
+		logErrors:    logErrors,
+	}
+	if t.writeBufSize <= 0 {
+		t.writeBufSize = 256 * 1024
 	}
 	t.queues = make([]chan tsdbItem, shards)
 	szPer := queueSize / shards
@@ -319,7 +324,7 @@ func (t *tsdbWriter) runWorker(ctx context.Context, id int, in <-chan tsdbItem) 
 					}
 					continue
 				}
-				fe = &fileEntry{f: f, w: bufio.NewWriterSize(f, 64*1024), lastUsed: time.Now()}
+				fe = &fileEntry{f: f, w: bufio.NewWriterSize(f, t.writeBufSize), lastUsed: time.Now()}
 				files[it.path] = fe
 			}
 			if _, err := fe.w.Write(it.line); err != nil {
@@ -502,8 +507,8 @@ var (
 	summariesRetentionHours = 8
 
 	// UDP collector concurrency controls (bounded)
-	collectorWorkers = runtime.GOMAXPROCS(0) * 2
-	collectorQueue   = 8192
+	collectorWorkers = runtime.GOMAXPROCS(0) * 4
+	collectorQueue   = 32768
 
 	// Max concurrent WebSocket log feed connections
 	wsMaxConns = 200
@@ -1456,7 +1461,11 @@ func main() {
 		idleSec := getenvInt("TSDB_IDLE_CLOSE_SEC", 60)
 		logDrops := getenvBool("TSDB_LOG_DROPS", false)
 		logErrors := getenvBool("TSDB_LOG_ERRORS", true)
-		tsdb = newTSDB(root, shards, qsize, time.Duration(flushMs)*time.Millisecond, time.Duration(idleSec)*time.Second, logDrops, logErrors)
+		wbufKB := getenvInt("TSDB_WRITE_BUFFER_KB", 256)
+		if wbufKB <= 0 {
+			wbufKB = 256
+		}
+		tsdb = newTSDB(root, shards, qsize, time.Duration(flushMs)*time.Millisecond, time.Duration(idleSec)*time.Second, logDrops, logErrors, wbufKB*1024)
 		// Optional filter by CIDR prefixes for src/dst addresses written to filesystem
 		if cidrs := getenv("TSDB_FILTER_CIDRS", ""); cidrs != "" {
 			nets := parseCIDRList(cidrs)
@@ -6850,6 +6859,7 @@ func effectiveConfig() map[string]string {
 	cfg["TSDB_ROOT"] = getenv("TSDB_ROOT", "E:\\DB")
 	cfg["TSDB_SHARDS"] = strconv.Itoa(getenvInt("TSDB_SHARDS", runtime.GOMAXPROCS(0)))
 	cfg["TSDB_QUEUE_SIZE"] = strconv.Itoa(getenvInt("TSDB_QUEUE_SIZE", 65536))
+	cfg["TSDB_WRITE_BUFFER_KB"] = strconv.Itoa(getenvInt("TSDB_WRITE_BUFFER_KB", 256))
 	cfg["TSDB_FLUSH_MS"] = strconv.Itoa(getenvInt("TSDB_FLUSH_MS", 1000))
 	cfg["TSDB_IDLE_CLOSE_SEC"] = strconv.Itoa(getenvInt("TSDB_IDLE_CLOSE_SEC", 60))
 	cfg["TSDB_LOG_DROPS"] = bool01(getenvBool("TSDB_LOG_DROPS", false))
