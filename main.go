@@ -31,6 +31,7 @@ import (
 	"archive/zip"
 	"bufio"
 	"compress/gzip"
+	"container/heap"
 	"context"
 	"encoding/binary"
 	"encoding/json"
@@ -1069,6 +1070,11 @@ var tsdb *tsdbWriter
 
 // Global CIDR filter for UI/API filtering independent of TSDB being enabled.
 var uiFilterCIDRs []*net.IPNet
+
+const (
+	defaultIPTableLimit = 200
+	maxIPTableLimit     = 2000
+)
 
 // newSessionsChan carries newly accepted sessions for optional live WebSocket feeds.
 var newSessionsChan = make(chan FlowSession, 1024)
@@ -5686,6 +5692,51 @@ func ipInLoggingPrefixes(ipStr string) bool {
 	return false
 }
 
+type ipTableRow struct {
+	IP      string `json:"ip"`
+	Country string `json:"country"`
+	Tx15m   int64  `json:"tx_15m"`
+	Rx15m   int64  `json:"rx_15m"`
+	Tot15m  int64  `json:"total_15m"`
+	Tx1h    int64  `json:"tx_1h"`
+	Rx1h    int64  `json:"rx_1h"`
+	Tot1h   int64  `json:"total_1h"`
+	Tx8h    int64  `json:"tx_8h"`
+	Rx8h    int64  `json:"rx_8h"`
+	Tot8h   int64  `json:"total_8h"`
+}
+
+type ipTableHeapEntry struct {
+	value int64
+	ip    string
+	row   ipTableRow
+}
+
+type ipTableMinHeap []ipTableHeapEntry
+
+func (h ipTableMinHeap) Len() int { return len(h) }
+
+func (h ipTableMinHeap) Less(i, j int) bool {
+	if h[i].value == h[j].value {
+		return h[i].ip > h[j].ip
+	}
+	return h[i].value < h[j].value
+}
+
+func (h ipTableMinHeap) Swap(i, j int) { h[i], h[j] = h[j], h[i] }
+
+func (h *ipTableMinHeap) Push(x any) {
+	*h = append(*h, x.(ipTableHeapEntry))
+}
+
+func (h *ipTableMinHeap) Pop() any {
+	old := *h
+	n := len(old)
+	item := old[n-1]
+	*h = old[:n-1]
+	return item
+}
+
 // ipTableHandler exposes per-IP totals for 15m, 1h, 8h using minute summaries, filtered by logging prefix list.
 func ipTableHandler(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
@@ -5696,6 +5747,19 @@ func ipTableHandler(w http.ResponseWriter, r *http.Request) {
 	sortWindow := strings.TrimSpace(strings.ToLower(r.URL.Query().Get("sort_window")))
 	if sortWindow == "" {
 		sortWindow = "1h"
+	}
+	limitParam := strings.TrimSpace(r.URL.Query().Get("limit"))
+	limit := defaultIPTableLimit
+	if limitParam != "" {
+		if n, err := strconv.Atoi(limitParam); err == nil {
+			if n < 0 {
+				n = 0
+			}
+			limit = n
+		}
+	}
+	if limit > maxIPTableLimit {
+		limit = maxIPTableLimit
 	}
 	now := time.Now().UTC().Truncate(time.Minute)
 	cut15 := now.Add(-15 * time.Minute).Unix()
@@ -5755,31 +5819,8 @@ func ipTableHandler(w http.ResponseWriter, r *http.Request) {
 	addFrom(true, store.ipMinuteTx)
 	addFrom(false, store.ipMinuteRx)
 
-	type row struct {
-		IP      string `json:"ip"`
-		Country string `json:"country"`
-		Tx15m   int64  `json:"tx_15m"`
-		Rx15m   int64  `json:"rx_15m"`
-		Tot15m  int64  `json:"total_15m"`
-		Tx1h    int64  `json:"tx_1h"`
-		Rx1h    int64  `json:"rx_1h"`
-		Tot1h   int64  `json:"total_1h"`
-		Tx8h    int64  `json:"tx_8h"`
-		Rx8h    int64  `json:"rx_8h"`
-		Tot8h   int64  `json:"total_8h"`
-	}
-	rows := make([]row, 0, len(acc))
-	for ip, a := range acc {
-		rows = append(rows, row{
-			IP:      ip,
-			Country: countryForIP(ip),
-			Tx15m:   a.Tx15, Rx15m: a.Rx15, Tot15m: a.Tx15 + a.Rx15,
-			Tx1h: a.Tx1h, Rx1h: a.Rx1h, Tot1h: a.Tx1h + a.Rx1h,
-			Tx8h: a.Tx8h, Rx8h: a.Rx8h, Tot8h: a.Tx8h + a.Rx8h,
-		})
-	}
 	// sort by selected window total desc, then IP asc
-	value := func(r row) int64 {
+	value := func(r ipTableRow) int64 {
 		switch sortWindow {
 		case "15m":
 			return r.Tot15m
@@ -5788,6 +5829,47 @@ func ipTableHandler(w http.ResponseWriter, r *http.Request) {
 		default:
 			return r.Tot1h
 		}
+	}
+	totalIPs := len(acc)
+	var rows []ipTableRow
+	if limit <= 0 || limit >= totalIPs {
+		rows = make([]ipTableRow, 0, len(acc))
+		for ip, a := range acc {
+			rows = append(rows, ipTableRow{
+				IP:    ip,
+				Tx15m: a.Tx15, Rx15m: a.Rx15, Tot15m: a.Tx15 + a.Rx15,
+				Tx1h: a.Tx1h, Rx1h: a.Rx1h, Tot1h: a.Tx1h + a.Rx1h,
+				Tx8h: a.Tx8h, Rx8h: a.Rx8h, Tot8h: a.Tx8h + a.Rx8h,
+			})
+		}
+	} else {
+		h := &ipTableMinHeap{}
+		heap.Init(h)
+		for ip, a := range acc {
+			rr := ipTableRow{
+				IP:    ip,
+				Tx15m: a.Tx15, Rx15m: a.Rx15, Tot15m: a.Tx15 + a.Rx15,
+				Tx1h: a.Tx1h, Rx1h: a.Rx1h, Tot1h: a.Tx1h + a.Rx1h,
+				Tx8h: a.Tx8h, Rx8h: a.Rx8h, Tot8h: a.Tx8h + a.Rx8h,
+			}
+			val := value(rr)
+			if h.Len() < limit {
+				heap.Push(h, ipTableHeapEntry{value: val, ip: ip, row: rr})
+				continue
+			}
+			worst := (*h)[0]
+			if val > worst.value || (val == worst.value && ip < worst.ip) {
+				heap.Pop(h)
+				heap.Push(h, ipTableHeapEntry{value: val, ip: ip, row: rr})
+			}
+		}
+		rows = make([]ipTableRow, h.Len())
+		for i := len(rows) - 1; i >= 0; i-- {
+			rows[i] = heap.Pop(h).(ipTableHeapEntry).row
+		}
+	}
+	for i := range rows {
+		rows[i].Country = countryForIP(rows[i].IP)
 	}
 	sort.Slice(rows, func(i, j int) bool {
 		vi, vj := value(rows[i]), value(rows[j])
@@ -5849,6 +5931,10 @@ func ipTableHandler(w http.ResponseWriter, r *http.Request) {
 	_ = json.NewEncoder(w).Encode(map[string]any{
 		"generated_at":   now.UTC().Format(time.RFC3339),
 		"sessions_total": sessionsTotal,
+		"total_ips":      totalIPs,
+		"limit":          limit,
+		"limit_applied":  limit > 0 && limit < totalIPs,
+		"rows_returned":  len(rows),
 		"rows":           rows,
 	})
 }
@@ -5892,11 +5978,22 @@ func ipTableIndexHandler(w http.ResponseWriter, r *http.Request) {
         <option value="8h">Last 8h</option>
       </select>
     </label>
+    <label>Show
+      <select id="limit">
+        <option value="50">Top 50</option>
+        <option value="100">Top 100</option>
+        <option value="200" selected>Top 200</option>
+        <option value="500">Top 500</option>
+        <option value="1000">Top 1000</option>
+        <option value="0">All (slow)</option>
+      </select>
+    </label>
     <button id="refresh">Refresh</button>
     <button id="badIpsBtn" title="View IPs that probed without response" onclick="window.location.href='/bad-ips'">Bad IPs</button>
-	<button id="statusBtn" title="View server status" onclick="window.location.href='/status'">Server Status</button>
+        <button id="statusBtn" title="View server status" onclick="window.location.href='/status'">Server Status</button>
     <small class="m">Only IPs within logging prefix list are shown.</small>
     <small class="m" id="sessInfo" style="margin-left:1rem">Total sessions: <span id="sessionsTotal">-</span></small>
+    <small class="m" id="limitNote" style="margin-left:1rem"></small>
   </div>
 </header>
 <div class="container">
@@ -6007,11 +6104,23 @@ async function loadPeers(ip){
 }
 async function load(){
   const sort=document.getElementById('sort').value;
-  const r=await fetch('/api/ip_table?sort_window='+encodeURIComponent(sort));
+  const limit=document.getElementById('limit').value;
+  const r=await fetch('/api/ip_table?sort_window='+encodeURIComponent(sort)+'&limit='+encodeURIComponent(limit));
   if(!r.ok){ throw new Error('http '+r.status); }
   const data=await r.json();
   if(document.getElementById('sessionsTotal')){
     document.getElementById('sessionsTotal').textContent = (data.sessions_total!=null?data.sessions_total:'-');
+  }
+  const note=document.getElementById('limitNote');
+  if(note){
+    if(data && data.limit_applied && data.total_ips!=null){
+      const count=(data.rows_returned!=null?data.rows_returned:(data.rows||[]).length);
+      note.textContent='Showing top '+count+' of '+data.total_ips+' IPs';
+    }else if(data && data.total_ips!=null){
+      note.textContent='Total IPs: '+data.total_ips;
+    }else{
+      note.textContent='';
+    }
   }
   const tbody=document.querySelector('#tbl tbody');
   tbody.innerHTML='';
@@ -6044,6 +6153,14 @@ function initFromURL(){
   if(sortParam==='15m'||sortParam==='1h'||sortParam==='8h'){
     document.getElementById('sort').value=sortParam;
   }
+  const limitParam=getParam('limit');
+  if(limitParam!=null){
+    const sel=document.getElementById('limit');
+    if(sel){
+      const exists=Array.from(sel.options).some(function(opt){ return opt.value===limitParam; });
+      if(exists){ sel.value=limitParam; }
+    }
+  }
   load();
   const ip=getParam('ip');
   if(ip){ loadPeers(ip); } else { hidePeers(); }
@@ -6051,6 +6168,11 @@ function initFromURL(){
 window.addEventListener('popstate', function(){
   const sortParam=getParam('sort');
   if(sortParam){ document.getElementById('sort').value=sortParam; }
+  const limitParam=getParam('limit');
+  if(limitParam){
+    const sel=document.getElementById('limit');
+    if(sel){ sel.value=limitParam; }
+  }
   load();
   const ip=getParam('ip');
   if(ip){ loadPeers(ip); } else { hidePeers(); }
@@ -6062,6 +6184,12 @@ document.getElementById('refresh').addEventListener('click', function(){
 document.getElementById('sort').addEventListener('change', function(){
   const sort=this.value;
   setParam('sort', sort);
+  load();
+  const ip=getParam('ip'); if(ip){ loadPeers(ip); }
+});
+document.getElementById('limit').addEventListener('change', function(){
+  const limit=this.value;
+  setParam('limit', limit);
   load();
   const ip=getParam('ip'); if(ip){ loadPeers(ip); }
 });
